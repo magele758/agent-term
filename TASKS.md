@@ -18,7 +18,7 @@
 - `run_shell` 把命令 stdin 交给 `.build-direct/headless/gate`（`Gate(rules: []).check`）。`deny` 不执行。`ask` 且没有 `AGENT_ASK_DIR` 时返回 `ask: no approver`，不执行。App 会建 ask 目录，主线程弹「允许 / 拒绝」，把 `allow` 或 `deny` 写进 `<uuid>.res`。
 - `⌘K` 的回复在标题为 Agent 的面板里，不调用 `term.send`。
 - 真实模型：用 `ppeng-agent-core/.env` 的 OpenAI 兼容端点跑 `读 README 并总结`，进程退出 0，stdout 是总结而不是报错。仓库没有 README，模型改读了 `PLAN.md` / `TASKS.md`。
-- 本机 `swift build` 仍不可用。不要删 `scripts/build.sh`。
+- `swift build --target TermApp` 可用。先跑一次 `scripts/fix-swiftpm.sh`，它在 `~/.local/bin/swift` 前插一个编译器包装，把旧的 `SwiftVersion` 符号别名到 `SwiftLanguageMode`，并藏掉重复的 `SwiftBridging` modulemap。不要删 `scripts/build.sh`：裸 `swift build` 还会去编 SwiftTerm 带进来的 argument-parser 插件，那份插件源码在本机 Swift 6.1.2 上编不过；App 包和 Metal 仍走 `build.sh`。
 
 ## 编译与运行
 
@@ -51,7 +51,7 @@ node agent/run.mjs echo echo parallel-sleep "$PWD"
 ## 剩下的
 
 1. ~~**辐射 CRT 主题。**~~ 已完成，见上面「现状」。
-2. **SwiftPM 修复**。本机 Command Line Tools 的 `libPackageDescription.dylib` 与 `swiftc` 版本不匹配，`swift build` 无法链接 manifest。等工具链更新后删掉 `scripts/build.sh` 这条旁路。现在不要做。
+2. ~~**SwiftPM 修复。**~~ manifest 链接已用 `scripts/fix-swiftpm.sh` 接上。`swift build --target TermApp` 能编过。裸 `swift build` 仍会编不兼容的 argument-parser 插件，所以 `scripts/build.sh` 先留着。
 
 ## 不要做
 
