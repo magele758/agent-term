@@ -24,11 +24,15 @@ final class TerminalHost: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     func setRoot(_ view: NSView) {
-        if root !== view { root?.removeFromSuperview() }
+        if root !== view, root?.superview === self {
+            root?.removeFromSuperview()
+        }
         root = view
         view.translatesAutoresizingMaskIntoConstraints = true
         view.autoresizingMask = []
-        addSubview(view, positioned: .below, relativeTo: hint)
+        if view.superview !== self {
+            addSubview(view, positioned: .below, relativeTo: hint)
+        }
         needsLayout = true
     }
 

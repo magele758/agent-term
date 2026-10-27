@@ -1,219 +1,403 @@
 import AppKit
+import Metal
 import QuartzCore
 
-// Fallout terminal / Pip-Boy CRT, from the in-game screen and the effects
-// players actually turn off (flicker, shudder, fade):
-// phosphor green grade, scanlines, interlace, glass sheen, vignette,
-// rounded tube bezel, rolling refresh bar, grain, sudden flicker, horizontal shudder.
-// Drawn as sibling layers above the terminal. Hit testing is off, so typing
-// still reaches the shell. Animations are Core Animation, not a per-frame redraw.
+// cool-retro-term look: the terminal pixels themselves are the source.
+// A light barrel bow, phosphor bloom, scanline beams, and edge RGB shift.
+// Edges stay the sampled terminal — no black tube bezel.
+// Hit testing stays off so keystrokes still reach the shell underneath.
 
 final class CRTOverlay: NSView {
-    private let grade = CALayer()
-    private let scan = CALayer()
-    private let sheen = CAGradientLayer()
-    private let vignette = CALayer()
-    private let noise = CALayer()
-    private let sweep = CAGradientLayer()
-    private let flicker = CALayer()
-    private let bezel = CAShapeLayer()
-    private var running = false
-    private var sweepSpan: CGFloat = -1
+    private(set) var isEnabled = false
+    private weak var source: NSView?
+    private var device: MTLDevice?
+    private var queue: MTLCommandQueue?
+    private var pipeline: MTLRenderPipelineState?
+    private var fadePipeline: MTLRenderPipelineState?
+    private var frameTex: MTLTexture?
+    private var texture: MTLTexture?
+    private var ghost = [MTLTexture?](repeating: nil, count: 2)
+    private var ghostSlot = 0
+    private var pixels: UnsafeMutableRawPointer?
+    private var pixW = 0
+    private var pixH = 0
+    private var link: CADisplayLink?
+    private let started = CACurrentMediaTime()
+    private var clear = MTLClearColor(red: 0.23, green: 0.14, blue: 0.06, alpha: 1)
+    private var phosphor = (r: Float(0.87), g: Float(0.52), b: Float(0.13))
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        layer?.masksToBounds = true
+        layerContentsRedrawPolicy = .never
         isHidden = true
-
-        grade.backgroundColor = NSColor(srgbRed: 0.15, green: 1, blue: 0.35, alpha: 0.07).cgColor
-        grade.compositingFilter = "softLightBlendMode"
-
-        scan.backgroundColor = NSColor(patternImage: Self.scanImage()).cgColor
-        scan.compositingFilter = "multiplyBlendMode"
-
-        sheen.colors = [
-            NSColor.white.withAlphaComponent(0.10).cgColor,
-            NSColor.white.withAlphaComponent(0.0).cgColor,
-            NSColor.white.withAlphaComponent(0.04).cgColor,
-        ]
-        sheen.locations = [0, 0.42, 1]
-        sheen.startPoint = CGPoint(x: 0, y: 1)
-        sheen.endPoint = CGPoint(x: 1, y: 0)
-
-        vignette.contents = Self.vignetteImage()
-        vignette.contentsGravity = .resize
-
-        noise.contents = Self.noiseImage()
-        noise.contentsGravity = .resize
-        noise.compositingFilter = "overlayBlendMode"
-        noise.opacity = 0.16
-
-        sweep.colors = [
-            NSColor.clear.cgColor,
-            NSColor(srgbRed: 0.75, green: 1, blue: 0.82, alpha: 0.16).cgColor,
-            NSColor.clear.cgColor,
-        ]
-        sweep.startPoint = CGPoint(x: 0.5, y: 0)
-        sweep.endPoint = CGPoint(x: 0.5, y: 1)
-        sweep.compositingFilter = "screenBlendMode"
-
-        flicker.backgroundColor = NSColor.black.cgColor
-        flicker.opacity = 0
-
-        bezel.fillColor = NSColor(srgbRed: 0.01, green: 0.03, blue: 0.01, alpha: 0.92).cgColor
-        bezel.fillRule = .evenOdd
-
-        for sub in [grade, scan, sheen, vignette, noise, sweep, flicker, bezel] {
-            layer?.addSublayer(sub)
-        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    override func makeBackingLayer() -> CALayer {
+        let metal = CAMetalLayer()
+        metal.pixelFormat = .bgra8Unorm
+        metal.framebufferOnly = true
+        metal.isOpaque = true
+        return metal
+    }
+
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
+    func bind(_ view: NSView) {
+        source = view
+        view.wantsLayer = true
+    }
+
+    func setBackground(_ color: NSColor) {
+        let srgb = color.usingColorSpace(.sRGB) ?? color
+        clear = MTLClearColor(
+            red: Double(srgb.redComponent),
+            green: Double(srgb.greenComponent),
+            blue: Double(srgb.blueComponent),
+            alpha: 1)
+    }
+
+    func setForeground(_ color: NSColor) {
+        let srgb = color.usingColorSpace(.sRGB) ?? color
+        phosphor = (Float(srgb.redComponent), Float(srgb.greenComponent), Float(srgb.blueComponent))
+    }
+
     func setEnabled(_ on: Bool) {
-        if on == running && isHidden == !on { return }
+        if on == isEnabled { return }
+        isEnabled = on
         isHidden = !on
         if on {
-            running = true
-            startMotion()
-            flashOn()
+            startMetal()
         } else {
-            running = false
-            sweepSpan = -1
-            layer?.sublayers?.forEach { $0.removeAllAnimations() }
+            link?.invalidate()
+            link = nil
         }
     }
 
     override func layout() {
         super.layout()
-        guard let host = layer else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        for sub in [grade, scan, sheen, vignette, noise, flicker] {
-            sub.frame = host.bounds
+        attachDevice()
+        guard let metal = layer as? CAMetalLayer else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        metal.contentsScale = scale
+        metal.drawableSize = CGSize(width: max(1, bounds.width * scale), height: max(1, bounds.height * scale))
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil, isEnabled else { return }
+        attachDevice()
+        armLink()
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        guard window != nil, isEnabled else { return }
+        attachDevice()
+        armLink()
+    }
+
+    private func attachDevice() {
+        guard let device, let metal = layer as? CAMetalLayer else { return }
+        if metal.device == nil { metal.device = device }
+    }
+
+    private func startMetal() {
+        guard pipeline == nil else { armLink(); return }
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue() else {
+            FileHandle.standardError.write(Data("crt: no metal device\n".utf8))
+            return
         }
-        sweep.frame = CGRect(x: 0, y: 0, width: host.bounds.width, height: 10)
-        bezel.frame = host.bounds
-        bezel.path = Self.bezelPath(host.bounds)
-        CATransaction.commit()
-        if running, abs(host.bounds.height - sweepSpan) > 2 {
-            startSweep(height: host.bounds.height)
+        do {
+            let library = try device.makeLibrary(source: Self.shader, options: nil)
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = library.makeFunction(name: "crt_vert")
+            desc.fragmentFunction = library.makeFunction(name: "crt_frag")
+            desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            let fade = MTLRenderPipelineDescriptor()
+            fade.vertexFunction = library.makeFunction(name: "crt_vert")
+            fade.fragmentFunction = library.makeFunction(name: "fade_frag")
+            fade.colorAttachments[0].pixelFormat = .bgra8Unorm
+            fadePipeline = try device.makeRenderPipelineState(descriptor: fade)
+        } catch {
+            FileHandle.standardError.write(Data("crt: \(error)\n".utf8))
+            return
         }
+        self.device = device
+        self.queue = queue
+        if let metal = layer as? CAMetalLayer { metal.device = device }
+        armLink()
     }
 
-    private func startMotion() {
-        noise.removeAnimation(forKey: "drift")
-        let drift = CABasicAnimation(keyPath: "transform.translation")
-        drift.fromValue = CGPoint.zero
-        drift.toValue = CGPoint(x: 18, y: -12)
-        drift.duration = 0.18
-        drift.autoreverses = true
-        drift.repeatCount = .infinity
-        drift.isRemovedOnCompletion = false
-        noise.add(drift, forKey: "drift")
-
-        flicker.removeAnimation(forKey: "dip")
-        let dip = CAKeyframeAnimation(keyPath: "opacity")
-        dip.values = [0.0, 0.0, 0.11, 0.0, 0.02, 0.0, 0.16, 0.04, 0.0, 0.07, 0.0]
-        dip.keyTimes = [0, 0.18, 0.19, 0.22, 0.45, 0.62, 0.63, 0.66, 0.78, 0.86, 1]
-        dip.duration = 2.8
-        dip.repeatCount = .infinity
-        dip.isRemovedOnCompletion = false
-        flicker.add(dip, forKey: "dip")
-
-        scan.removeAnimation(forKey: "shudder")
-        let shudder = CAKeyframeAnimation(keyPath: "transform.translation.x")
-        shudder.values = [0, 0, 1.5, -1, 0, 0, 2, 0]
-        shudder.keyTimes = [0, 0.62, 0.63, 0.65, 0.67, 0.84, 0.85, 1]
-        shudder.duration = 3.4
-        shudder.repeatCount = .infinity
-        shudder.isRemovedOnCompletion = false
-        scan.add(shudder, forKey: "shudder")
-
-        startSweep(height: bounds.height)
+    private func armLink() {
+        guard link == nil else { return }
+        let link = displayLink(target: self, selector: #selector(tick))
+        link.add(to: .main, forMode: .common)
+        self.link = link
     }
 
-    private func startSweep(height: CGFloat) {
-        sweepSpan = height
-        sweep.removeAnimation(forKey: "roll")
-        guard height > 20 else { return }
-        let roll = CABasicAnimation(keyPath: "position.y")
-        roll.fromValue = height + 8
-        roll.toValue = -8
-        roll.duration = 7.5
-        roll.repeatCount = .infinity
-        roll.isRemovedOnCompletion = false
-        sweep.add(roll, forKey: "roll")
-    }
+    @objc private func tick() {
+        guard isEnabled, bounds.width > 2, bounds.height > 2,
+              let source, let pipeline, let queue,
+              let metal = layer as? CAMetalLayer, metal.device != nil,
+              let drawable = metal.nextDrawable() else { return }
+        let scale = metal.contentsScale
+        guard capture(source, scale: scale), let texture else { return }
+        let dw = max(1, Int(metal.drawableSize.width))
+        let dh = max(1, Int(metal.drawableSize.height))
+        ensureTargets(dw, dh)
+        guard let frameTex, let prev = ghost[ghostSlot], let next = ghost[1 - ghostSlot], let fadePipeline else { return }
 
-    private func flashOn() {
-        let flash = CABasicAnimation(keyPath: "opacity")
-        flash.fromValue = 0.55
-        flash.toValue = 0
-        flash.duration = 0.22
-        flicker.add(flash, forKey: "power")
-    }
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = frameTex
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = clear
+        guard let buffer = queue.makeCommandBuffer(),
+              let enc = buffer.makeRenderCommandEncoder(descriptor: pass) else { return }
 
-    private static func scanImage() -> NSImage {
-        let image = NSImage(size: NSSize(width: 1, height: 4))
-        image.lockFocus()
-        NSColor(white: 0, alpha: 0.62).setFill()
-        NSRect(x: 0, y: 3, width: 1, height: 1).fill()
-        NSColor(white: 0, alpha: 0.18).setFill()
-        NSRect(x: 0, y: 1, width: 1, height: 1).fill()
-        image.unlockFocus()
-        return image
-    }
+        var u = CRTUniforms(
+            time: Float(CACurrentMediaTime() - started),
+            curvature: 0.20,
+            frame: 0.008,
+            bloom: 0.85,
+            scan: 0.85,
+            rgbShift: 0.0011,
+            lines: Float(bounds.height * scale / 2.0),
+            glassR: Float(clear.red),
+            glassG: Float(clear.green),
+            glassB: Float(clear.blue),
+            fgR: phosphor.r,
+            fgG: phosphor.g,
+            fgB: phosphor.b
+        )
+        enc.setRenderPipelineState(pipeline)
+        enc.setFragmentTexture(texture, index: 0)
+        enc.setFragmentTexture(prev, index: 1)
+        enc.setFragmentBytes(&u, length: MemoryLayout<CRTUniforms>.stride, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
 
-    private static func vignetteImage() -> CGImage? {
-        let side = 256
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8,
-                                  bytesPerRow: 0, space: colorSpace,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-        let colors = [
-            NSColor.clear.cgColor,
-            NSColor.black.withAlphaComponent(0.15).cgColor,
-            NSColor.black.withAlphaComponent(0.72).cgColor,
-        ] as CFArray
-        let locations: [CGFloat] = [0.45, 0.78, 1]
-        guard let gradient = CGGradient(colorsSpace: colorSpace, colors: colors, locations: locations) else { return nil }
-        ctx.drawRadialGradient(gradient,
-                               startCenter: CGPoint(x: side / 2, y: side / 2), startRadius: 20,
-                               endCenter: CGPoint(x: side / 2, y: side / 2), endRadius: CGFloat(side) * 0.72,
-                               options: [])
-        return ctx.makeImage()
-    }
-
-    private static func noiseImage() -> CGImage? {
-        let side = 128
-        var bytes = [UInt8](repeating: 0, count: side * side * 4)
-        for i in stride(from: 0, to: bytes.count, by: 4) {
-            let n = UInt8.random(in: 0...255)
-            bytes[i] = n
-            bytes[i + 1] = n
-            bytes[i + 2] = n
-            bytes[i + 3] = UInt8.random(in: 40...180)
+        if let blit = buffer.makeBlitCommandEncoder() {
+            blit.copy(from: frameTex, sourceSlice: 0, sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: dw, height: dh, depth: 1),
+                      to: drawable.texture, destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            blit.endEncoding()
         }
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let data = Data(bytes)
-        guard let provider = CGDataProvider(data: data as CFData),
-              let image = CGImage(width: side, height: side, bitsPerComponent: 8, bitsPerPixel: 32,
-                                  bytesPerRow: side * 4, space: colorSpace,
-                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-                                  provider: provider, decode: nil, shouldInterpolate: false,
-                                  intent: .defaultIntent) else { return nil }
-        return image
+
+        let fadePass = MTLRenderPassDescriptor()
+        fadePass.colorAttachments[0].texture = next
+        fadePass.colorAttachments[0].loadAction = .dontCare
+        fadePass.colorAttachments[0].storeAction = .store
+        if let fadeEnc = buffer.makeRenderCommandEncoder(descriptor: fadePass) {
+            fadeEnc.setRenderPipelineState(fadePipeline)
+            fadeEnc.setFragmentTexture(frameTex, index: 0)
+            fadeEnc.setFragmentTexture(prev, index: 1)
+            fadeEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            fadeEnc.endEncoding()
+            ghostSlot = 1 - ghostSlot
+        }
+        buffer.present(drawable)
+        buffer.commit()
     }
 
-    private static func bezelPath(_ rect: CGRect) -> CGPath {
-        let path = CGMutablePath()
-        path.addRect(rect)
-        let inner = rect.insetBy(dx: 7, dy: 7)
-        path.addRoundedRect(in: inner, cornerWidth: 10, cornerHeight: 10)
-        return path
+    private func ensureTargets(_ w: Int, _ h: Int) {
+        if frameTex?.width == w, frameTex?.height == h, ghost[0] != nil { return }
+        frameTex = makeTarget(w, h)
+        ghost = [makeTarget(w, h), makeTarget(w, h)]
+        ghostSlot = 0
     }
+
+    private func makeTarget(_ w: Int, _ h: Int) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+        desc.usage = [.shaderRead, .renderTarget]
+        desc.storageMode = .private
+        return device?.makeTexture(descriptor: desc)
+    }
+
+    private func capture(_ view: NSView, scale: CGFloat) -> Bool {
+        let w = max(1, Int(view.bounds.width * scale))
+        let h = max(1, Int(view.bounds.height * scale))
+        guard let device,
+              let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB,
+                bitmapFormat: [.thirtyTwoBitLittleEndian, .alphaFirst],
+                bytesPerRow: w * 4, bitsPerPixel: 32),
+              let data = rep.bitmapData,
+              let gfx = NSGraphicsContext(bitmapImageRep: rep) else { return false }
+        gfx.cgContext.translateBy(x: 0, y: CGFloat(h))
+        gfx.cgContext.scaleBy(x: scale, y: -scale)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = gfx
+        view.displayIgnoringOpacity(view.bounds, in: gfx)
+        NSGraphicsContext.restoreGraphicsState()
+        let rowBytes = w * 4
+        let tmp = UnsafeMutableRawPointer.allocate(byteCount: rowBytes, alignment: 16)
+        defer { tmp.deallocate() }
+        for y in 0..<(h / 2) {
+            let top = data.advanced(by: y * rowBytes)
+            let bot = data.advanced(by: (h - 1 - y) * rowBytes)
+            tmp.copyMemory(from: UnsafeRawPointer(top), byteCount: rowBytes)
+            UnsafeMutableRawPointer(top).copyMemory(from: UnsafeRawPointer(bot), byteCount: rowBytes)
+            UnsafeMutableRawPointer(bot).copyMemory(from: tmp, byteCount: rowBytes)
+        }
+        if pixW != w || pixH != h || texture == nil {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+            desc.usage = [.shaderRead]
+            texture = device.makeTexture(descriptor: desc)
+            pixW = w
+            pixH = h
+        }
+        texture?.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: data, bytesPerRow: w * 4)
+        return texture != nil
+    }
+
+    deinit {
+        link?.invalidate()
+        pixels?.deallocate()
+    }
+
+    private static let shader = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    struct U {
+        float time;
+        float curvature;
+        float frame;
+        float bloom;
+        float scan;
+        float rgbShift;
+        float lines;
+        float glassR;
+        float glassG;
+        float glassB;
+        float fgR;
+        float fgG;
+        float fgB;
+    };
+
+    struct VOut {
+        float4 pos [[position]];
+        float2 uv;
+    };
+
+    vertex VOut crt_vert(uint vid [[vertex_id]]) {
+        float2 p = float2((vid << 1) & 2, vid & 2);
+        VOut o;
+        o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);
+        o.uv = float2(p.x, p.y);
+        return o;
+    }
+
+    float2 barrel(float2 uv, float curvature, float frame) {
+        float2 padded = uv * (1.0 + frame * 2.0) - frame;
+        float2 cc = padded - 0.5;
+        float dist = dot(cc, cc) * curvature;
+        return padded + cc * (1.0 + dist) * dist;
+    }
+
+    fragment float4 crt_frag(VOut in [[stage_in]],
+                             texture2d<float> src [[texture(0)]],
+                             texture2d<float> ghost [[texture(1)]],
+                             constant U &u [[buffer(0)]]) {
+        constexpr sampler smp(address::clamp_to_edge, filter::linear);
+        float2 curved = barrel(in.uv, u.curvature, u.frame);
+        float2 box = min(curved, 1.0 - curved);
+        float inside = smoothstep(-0.002, 0.012, min(box.x, box.y));
+        float2 noiseUv = curved * 6.0 + float2(fract(u.time / 0.051), fract(u.time / 0.237));
+        float nA = fract(sin(dot(floor(noiseUv * 48.0), float2(12.9898, 78.233))) * 43758.5453);
+        float nB = fract(sin(dot(floor(noiseUv * 48.0) + 19.0, float2(39.346, 11.135))) * 43758.5453);
+        float2 su = curved + (float2(nB, nA) - 0.5) * float2(0.00035, 0.0001);
+        float hnoise = fract(sin(floor(u.time * 2.5) * 91.7) * 43758.5453);
+        float randval = 0.074 - hnoise;
+        float dscale = step(0.0, randval) * randval * 0.45;
+        float dfreq = mix(4.0, 40.0, fract(sin(floor(u.time * 2.5) * 17.3) * 43758.5453));
+        su.x += sin((curved.y + u.time) * dfreq) * dscale * 0.006;
+        float2 clamped = clamp(su, 0.0, 1.0);
+        float2 suv = float2(clamped.x, 1.0 - clamped.y);
+        float2 texel = 1.0 / float2(src.get_width(), src.get_height());
+
+        float3 glass = float3(u.glassR, u.glassG, u.glassB);
+        float3 fg = float3(u.fgR, u.fgG, u.fgB);
+        float3 raw = src.sample(smp, suv).rgb;
+        float lum = dot(raw, float3(0.30, 0.59, 0.11));
+        float3 c = mix(glass, fg, smoothstep(0.04, 0.62, lum));
+        float edge = length(curved - 0.5);
+        float shift = u.rgbShift * (0.35 + edge * 2.2);
+        float3 right = src.sample(smp, suv + float2(shift, 0.0)).rgb;
+        float3 left = src.sample(smp, suv - float2(shift, 0.0)).rgb;
+        c.r = left.r * 0.18 + c.r * 0.82;
+        c.b = right.b * 0.18 + c.b * 0.82;
+
+        float3 glow = float3(0.0);
+        float wsum = 0.0;
+        for (int i = -3; i <= 3; i++) {
+            for (int j = -3; j <= 3; j++) {
+                float w = exp(-float(i * i + j * j) * 0.22);
+                float s = dot(src.sample(smp, suv + float2(i, j) * texel * 1.8).rgb, float3(0.30, 0.59, 0.11));
+                glow += src.sample(smp, suv + float2(i, j) * texel * 1.8).rgb * w * s;
+                wsum += w;
+            }
+        }
+        c += glow / max(wsum, 0.0001) * u.bloom * 0.55;
+
+        float beam = abs(sin(curved.y * u.lines * 3.14159));
+        c *= mix(0.84, 1.06, beam);
+
+        float2 vig = (clamped - 0.5) * 2.0;
+        float vigAmt = clamp(1.0 - dot(vig * float2(0.35, 0.42), vig * float2(0.35, 0.42)), 0.0, 1.0);
+        c *= mix(0.78, 1.0, vigAmt);
+
+        float distc = length(curved - 0.5);
+        c += fg * nA * 0.028 * max(0.0, 1.0 - distc * 1.3) * inside;
+        float sweep = fract(u.time * 0.15);
+        float pass = smoothstep(0.03, 0.0, abs(curved.y - sweep));
+        c += fg * pass * 0.045 * inside;
+        float flickNoise = fract(sin(floor(u.time * 1.5) * 12.9898) * 43758.5453);
+        c *= 1.0 + (flickNoise - 0.5) * 0.035;
+        float3 burned = ghost.sample(smp, float2(in.uv.x, 1.0 - in.uv.y)).rgb;
+        c = max(c, burned * 0.42);
+        float rim = smoothstep(0.0, 0.016, min(box.x, box.y)) * smoothstep(0.04, 0.01, min(box.x, box.y));
+        c += fg * rim * 0.08;
+        c = mix(glass * 0.35, c, inside);
+        return float4(c, 1.0);
+    }
+
+    fragment float4 fade_frag(VOut in [[stage_in]],
+                              texture2d<float> frame [[texture(0)]],
+                              texture2d<float> prev [[texture(1)]]) {
+        constexpr sampler smp(address::clamp_to_edge, filter::linear);
+        float2 guv = float2(in.uv.x, 1.0 - in.uv.y);
+        float3 now = frame.sample(smp, guv).rgb;
+        float3 old = prev.sample(smp, guv).rgb;
+        return float4(max(now, old * 0.972), 1.0);
+    }
+    """
+}
+
+private struct CRTUniforms {
+    var time: Float
+    var curvature: Float
+    var frame: Float
+    var bloom: Float
+    var scan: Float
+    var rgbShift: Float
+    var lines: Float
+    var glassR: Float
+    var glassG: Float
+    var glassB: Float
+    var fgR: Float
+    var fgG: Float
+    var fgB: Float
 }

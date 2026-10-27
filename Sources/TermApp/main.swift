@@ -104,33 +104,80 @@ enum Keychain {
     static let account = "modelApiKey"
 
     static func load() -> String {
+        if let key = readSilent(), key.isEmpty == false { return key }
+        return envFallback()
+    }
+
+    static func save(_ value: String) {
+        let data = Data(value.utf8)
+        var base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip,
+        ]
+        SecItemDelete(base as CFDictionary)
+        base[kSecValueData as String] = data
+        base[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        if let access = anyAppAccess() {
+            base[kSecAttrAccess as String] = access
+        }
+        SecItemAdd(base as CFDictionary, nil)
+    }
+
+    private static func readSilent() -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip,
         ]
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
               let data = item as? Data,
-              let text = String(data: data, encoding: .utf8) else { return "" }
+              let text = String(data: data, encoding: .utf8) else { return nil }
         return text
     }
 
-    static func save(_ value: String) {
-        let data = Data(value.utf8)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        let attrs: [String: Any] = [kSecValueData as String: data]
-        if SecItemUpdate(query as CFDictionary, attrs as CFDictionary) == errSecItemNotFound {
-            var add = query
-            add[kSecValueData as String] = data
-            SecItemAdd(add as CFDictionary, nil)
+    // A rebuilt unsigned binary is a new app to the login keychain. An empty
+    // trusted-app list plus no prompt selector lets later builds read the item
+    // without asking for the login password again.
+    private static func anyAppAccess() -> SecAccess? {
+        var access: SecAccess?
+        guard SecAccessCreate("agent-term" as CFString, nil, &access) == errSecSuccess,
+              let access else { return nil }
+        var list: CFArray?
+        guard SecAccessCopyACLList(access, &list) == errSecSuccess,
+              let acls = list as? [SecACL] else { return access }
+        let prompt = SecKeychainPromptSelector(rawValue: 0)
+        for acl in acls {
+            SecACLSetContents(acl, nil, "agent-term" as CFString, prompt)
         }
+        return access
+    }
+
+    private static func envFallback() -> String {
+        if let key = ProcessInfo.processInfo.environment["AGENT_API_KEY"], key.isEmpty == false {
+            return key
+        }
+        let exe = URL(fileURLWithPath: CommandLine.arguments.first ?? "")
+            .deletingLastPathComponent()
+        let candidates = [
+            exe.appendingPathComponent("../../ppeng-agent-core/.env"),
+            exe.deletingLastPathComponent().appendingPathComponent("../ppeng-agent-core/.env"),
+        ]
+        for url in candidates {
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            for line in text.split(separator: "\n") {
+                let row = line.trimmingCharacters(in: .whitespaces)
+                guard row.hasPrefix("RAW_AGENT_API_KEY=") else { continue }
+                let key = String(row.dropFirst("RAW_AGENT_API_KEY=".count))
+                if key.isEmpty == false { return key }
+            }
+        }
+        return ""
     }
 }
 
@@ -187,10 +234,12 @@ final class TermPane: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
+        layer?.masksToBounds = true
         layer?.borderColor = NSColor.systemBlue.cgColor
         term.autoresizingMask = [.width, .height]
         addSubview(term)
         addSubview(crt)
+        crt.bind(term)
         badge.font = NSFont.systemFont(ofSize: 11, weight: .medium)
         badge.textColor = NSColor.systemOrange
         badge.drawsBackground = false
@@ -226,9 +275,16 @@ final class TermPane: NSView {
         if let style = CursorStyle(tagName: cfg.cursorStyle) {
             term.terminal.setCursorStyle(style)
         }
-        crt.setEnabled(cfg.themeName == "辐射")
-        layer?.borderColor = (cfg.themeName == "辐射"
-            ? NSColor(srgbRed: 0.2, green: 0.45, blue: 0.22, alpha: 1)
+        let crtOn = ["辐射", "琥珀", "蓝"].contains(cfg.themeName)
+        crt.setEnabled(crtOn)
+        if crtOn {
+            crt.setBackground(color(bg))
+            crt.setForeground(color(fg))
+            try? term.setUseMetal(false)
+            layer?.borderWidth = 0
+        }
+        layer?.borderColor = (crtOn
+            ? NSColor(srgbRed: 0.02, green: 0.05, blue: 0.02, alpha: 1)
             : NSColor.systemBlue).cgColor
     }
 
@@ -255,7 +311,7 @@ final class TermPane: NSView {
 
     func focus() { window?.makeFirstResponder(term) }
 
-    func markFocused(_ on: Bool) { layer?.borderWidth = on ? 1 : 0 }
+    func markFocused(_ on: Bool) { layer?.borderWidth = (on && crt.isEnabled == false) ? 1 : 0 }
 
     func setBadge(_ text: String?) {
         badge.stringValue = text ?? ""
@@ -265,7 +321,7 @@ final class TermPane: NSView {
 
     // Otty: one GPU layer per pane, dirty rows only. Call after the view is in a window.
     func enableGpu() {
-        guard window != nil, term.isUsingMetalRenderer == false else { return }
+        guard window != nil, term.isUsingMetalRenderer == false, crt.isEnabled == false else { return }
         do {
             try term.setUseMetal(true)
             term.metalBufferingMode = .perRowPersistent
@@ -305,6 +361,8 @@ final class SplitView: NSView {
         self.second = second
         self.sideBySide = sideBySide
         super.init(frame: .zero)
+        wantsLayer = true
+        layer?.masksToBounds = true
         for v in [first, second] {
             v.translatesAutoresizingMaskIntoConstraints = true
             v.autoresizingMask = []
@@ -623,14 +681,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             submitComposer(forceQueue: false)
             return nil
         }
-        if key == "d" { split(sideBySide: !flags.contains(.shift)); return nil }
-        if key == "w" { closeFocused(); return nil }
-        if key == "," { openSettings(); return nil }
-        if key == "k" { focusAgent(); return nil }
-        if key == "p" && flags.contains(.shift) { showPalette(); return nil }
-        if key == "=" || key == "+" { zoom(by: 1); return nil }
-        if key == "-" { zoom(by: -1); return nil }
-        if key == "0" { zoom(by: 0); return nil }
+        if key == "d" || key == "w" || key == "," || key == "k" { return event }
+        if key == "p" && flags.contains(.shift) { return event }
+        if key == "=" || key == "+" || key == "-" || key == "0" { return event }
         if flags.contains(.option) {
             switch event.keyCode {
             case 123: focus(dx: -1, dy: 0); return nil
@@ -1053,7 +1106,15 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.showWindow(nil)
     }
 
+    private var splitting = false
+    private var lastSplitAt: TimeInterval = 0
+
     private func split(sideBySide: Bool) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard splitting == false, now - lastSplitAt > 0.05 else { return }
+        splitting = true
+        lastSplitAt = now
+        defer { splitting = false }
         guard let pane = focusedPane(), let parent = pane.superview else { return }
         let neu = TermPane(frame: pane.frame)
         if let parent = parent as? SplitView {
