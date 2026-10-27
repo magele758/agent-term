@@ -50,7 +50,8 @@ node agent/run.mjs echo echo parallel-sleep "$PWD"
 
 ## 剩下的
 
-1. **SwiftPM 修复**。本机 Command Line Tools 的 `libPackageDescription.dylib` 与 `swiftc` 版本不匹配，`swift build` 无法链接 manifest。等工具链更新后删掉 `scripts/build.sh` 这条旁路。现在不要做。
+1. ~~**辐射 CRT 主题。**~~ 已完成，见上面「现状」。
+2. **SwiftPM 修复**。本机 Command Line Tools 的 `libPackageDescription.dylib` 与 `swiftc` 版本不匹配，`swift build` 无法链接 manifest。等工具链更新后删掉 `scripts/build.sh` 这条旁路。现在不要做。
 
 ## 不要做
 
