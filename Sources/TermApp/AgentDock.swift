@@ -73,6 +73,7 @@ final class ShellView: NSView {
     let sidebar = TabSidebar(frame: .zero)
     var showDock = true
     var showSidebar = true
+    private let revealSide = NSButton()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -80,6 +81,15 @@ final class ShellView: NSView {
         layer?.backgroundColor = NSColor.clear.cgColor
         layer?.isOpaque = false
         addSubview(sidebar)
+        revealSide.title = "标签"
+        revealSide.bezelStyle = .inline
+        revealSide.isBordered = false
+        revealSide.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        revealSide.contentTintColor = .white
+        revealSide.toolTip = "展开侧栏"
+        revealSide.target = self
+        revealSide.action = #selector(revealSidebar)
+        addSubview(revealSide)
         addSubview(host)
         addSubview(dock)
     }
@@ -95,12 +105,15 @@ final class ShellView: NSView {
         showSidebar = on
         needsLayout = true
     }
+    @objc private func revealSidebar() { setSidebarVisible(true) }
 
     override func layout() {
         super.layout()
         let side: CGFloat = showSidebar ? 200 : 0
         sidebar.isHidden = !showSidebar
         sidebar.frame = NSRect(x: 0, y: 0, width: side, height: bounds.height)
+        revealSide.isHidden = showSidebar
+        revealSide.frame = NSRect(x: 4, y: bounds.height - 28, width: 36, height: 20)
         let dockWidth = showDock ? min(400, max(300, floor(bounds.width * 0.34))) : 0
         dock.isHidden = !showDock
         dock.frame = NSRect(x: bounds.width - dockWidth, y: 0, width: dockWidth, height: bounds.height)
@@ -114,7 +127,7 @@ final class AgentDock: NSView, NSTextViewDelegate {
     var onAttach: (() -> Void)?
     var onHide: (() -> Void)?
     var onApprove: ((String, Bool) -> Void)?
-
+    var onSaveModel: ((String, String, String) -> Void)?
     private let state = NSTextField(labelWithString: "空闲")
     private let model = NSTextField(labelWithString: "")
     private let transcript = NSTextView()
@@ -128,7 +141,14 @@ final class AgentDock: NSView, NSTextViewDelegate {
     private let composerScroll = NSScrollView()
     private let placeholder = ClickThroughLabel(labelWithString: "描述要做的事\n⌘↩ 发送 · ↩ 换行 · ⌥⌘↩ 排队")
     private let plate = NSVisualEffectView()
-
+    private let modelPanel = NSView()
+    private let presetPopup = NSPopUpButton()
+    private let urlField = NSTextField(string: "")
+    private let nameField = NSTextField(string: "")
+    private let keyField = NSSecureTextField(string: "")
+    private let urlLabel = NSTextField(labelWithString: "服务地址")
+    private let nameLabel = NSTextField(labelWithString: "模型名")
+    private let keyLabel = NSTextField(labelWithString: "API Key")
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
@@ -206,8 +226,11 @@ final class AgentDock: NSView, NSTextViewDelegate {
         attach.tag = 3
         queue.tag = 4
         send.tag = 5
-
-        for view in [state, model, hide, transcriptScroll, approval, chip, queueLabel, composerScroll, placeholder, attach, queue, send] {
+        let configure = button("配置", #selector(toggleModelPanel))
+        configure.tag = 6
+        configure.toolTip = "配置模型"
+        buildModelPanel()
+        for view in [state, model, hide, configure, transcriptScroll, approval, chip, queueLabel, composerScroll, placeholder, attach, queue, send, modelPanel] {
             addSubview(view)
         }
     }
@@ -221,6 +244,13 @@ final class AgentDock: NSView, NSTextViewDelegate {
 
     func setModel(_ text: String) {
         model.stringValue = text
+    }
+
+    func setModelFields(url: String, name: String, key: String) {
+        urlField.stringValue = url
+        nameField.stringValue = name
+        keyField.stringValue = key
+        selectPreset(matching: url)
     }
 
     func append(_ title: String, _ body: String) {
@@ -274,6 +304,9 @@ final class AgentDock: NSView, NSTextViewDelegate {
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
+        if modelPanel.isHidden == false, modelPanel.frame.contains(point) {
+            return super.hitTest(point)
+        }
         if composerScroll.frame.contains(point) {
             return composer
         }
@@ -284,6 +317,10 @@ final class AgentDock: NSView, NSTextViewDelegate {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        if modelPanel.isHidden == false, modelPanel.frame.contains(point) {
+            super.mouseDown(with: event)
+            return
+        }
         if composerScroll.frame.contains(point) {
             window?.makeFirstResponder(composer)
         }
@@ -300,7 +337,8 @@ final class AgentDock: NSView, NSTextViewDelegate {
         let width = bounds.width
         let top = Glass.titleInset(in: self) + 8
         state.frame = NSRect(x: pad, y: bounds.height - top - 16, width: 80, height: 16)
-        model.frame = NSRect(x: 96, y: bounds.height - top - 16, width: max(0, width - 168), height: 16)
+        model.frame = NSRect(x: 96, y: bounds.height - top - 16, width: max(0, width - 224), height: 16)
+        viewWithTag(6)?.frame = NSRect(x: width - 120, y: bounds.height - top - 20, width: 52, height: 22)
         viewWithTag(2)?.frame = NSRect(x: width - 64, y: bounds.height - top - 20, width: 52, height: 22)
         let footer: CGFloat = 36
         let composerH: CGFloat = 88
@@ -332,6 +370,11 @@ final class AgentDock: NSView, NSTextViewDelegate {
         viewWithTag(3)?.frame = NSRect(x: pad, y: 8, width: 78, height: 24)
         viewWithTag(4)?.frame = NSRect(x: width - 148, y: 8, width: 58, height: 24)
         viewWithTag(5)?.frame = NSRect(x: width - 84, y: 8, width: 72, height: 24)
+        if modelPanel.isHidden == false {
+            let panelH: CGFloat = 168
+            modelPanel.frame = NSRect(x: pad, y: bounds.height - top - 28 - panelH, width: width - pad * 2, height: panelH)
+            layoutModelPanel()
+        }
     }
 
     @objc private func allowAsk() { resolve(true) }
@@ -346,6 +389,79 @@ final class AgentDock: NSView, NSTextViewDelegate {
     @objc private func attachScreen() { onAttach?() }
     @objc private func queueDraft() { onQueue?() }
     @objc private func sendDraft() { onSend?() }
+
+    @objc private func toggleModelPanel() {
+        modelPanel.isHidden.toggle()
+        needsLayout = true
+    }
+
+    @objc private func presetPicked() {
+        guard let url = Self.presetURLs[presetPopup.titleOfSelectedItem ?? ""] else { return }
+        urlField.stringValue = url
+    }
+
+    @objc private func saveModelFields() {
+        onSaveModel?(
+            urlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            keyField.stringValue
+        )
+        modelPanel.isHidden = true
+        needsLayout = true
+    }
+
+    private static let presetURLs = [
+        "OpenAI": "https://api.openai.com/v1",
+        "DeepSeek": "https://api.deepseek.com/v1",
+        "通义千问": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    ]
+
+    private func buildModelPanel() {
+        modelPanel.wantsLayer = true
+        modelPanel.isHidden = true
+        modelPanel.layer?.cornerRadius = 8
+        modelPanel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.78).cgColor
+        modelPanel.layer?.borderWidth = 1
+        modelPanel.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+        presetPopup.addItems(withTitles: ["OpenAI", "DeepSeek", "通义千问", "自定义"])
+        presetPopup.selectItem(withTitle: "自定义")
+        presetPopup.target = self
+        presetPopup.action = #selector(presetPicked)
+        presetPopup.font = NSFont.systemFont(ofSize: 12)
+        for field in [urlField, nameField, keyField] {
+            field.font = NSFont.systemFont(ofSize: 12)
+            field.bezelStyle = .roundedBezel
+        }
+        for label in [urlLabel, nameLabel, keyLabel] {
+            label.font = NSFont.systemFont(ofSize: 11)
+            label.textColor = .secondaryLabelColor
+        }
+        let save = button("保存", #selector(saveModelFields))
+        save.tag = 7
+        for view in [presetPopup, urlLabel, urlField, nameLabel, nameField, keyLabel, keyField, save] as [NSView] {
+            modelPanel.addSubview(view)
+        }
+    }
+
+    private func selectPreset(matching url: String) {
+        let title = Self.presetURLs.first { $0.value == url }?.key ?? "自定义"
+        presetPopup.selectItem(withTitle: title)
+    }
+
+    private func layoutModelPanel() {
+        let b = modelPanel.bounds
+        let inset: CGFloat = 8
+        let labelW: CGFloat = 62
+        let rowH: CGFloat = 22
+        presetPopup.frame = NSRect(x: inset, y: b.height - 32, width: b.width - inset * 2, height: 24)
+        var y = b.height - 58
+        for (label, field) in [(urlLabel, urlField), (nameLabel, nameField), (keyLabel, keyField)] {
+            label.frame = NSRect(x: inset, y: y, width: labelW, height: rowH)
+            field.frame = NSRect(x: inset + labelW, y: y, width: b.width - inset * 2 - labelW, height: rowH)
+            y -= 28
+        }
+        modelPanel.viewWithTag(7)?.frame = NSRect(x: b.width - inset - 64, y: 8, width: 64, height: 22)
+    }
 
     private func styleLabel(_ field: NSTextField, size: CGFloat, weight: NSFont.Weight, color: NSColor) {
         field.font = NSFont.systemFont(ofSize: size, weight: weight)

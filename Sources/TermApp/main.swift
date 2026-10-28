@@ -24,7 +24,7 @@ struct Config: Codable {
 
     enum CodingKeys: String, CodingKey {
         case fontName, fontSize, foreground, background, cursor, selection, opacity
-        case shell, login, optionAsMeta, env, modelBaseUrl, modelName
+        case shell, login, optionAsMeta, env, modelBaseUrl, modelName, modelApiKey
         case themeName, cursorStyle, lineSpacing
     }
 
@@ -45,6 +45,7 @@ struct Config: Codable {
         env = try c.decodeIfPresent([String].self, forKey: .env) ?? []
         modelBaseUrl = try c.decodeIfPresent(String.self, forKey: .modelBaseUrl) ?? ""
         modelName = try c.decodeIfPresent(String.self, forKey: .modelName) ?? ""
+        modelApiKey = try c.decodeIfPresent(String.self, forKey: .modelApiKey) ?? ""
         themeName = try c.decodeIfPresent(String.self, forKey: .themeName) ?? "默认"
         cursorStyle = try c.decodeIfPresent(String.self, forKey: .cursorStyle) ?? "blinkBlock"
         lineSpacing = try c.decodeIfPresent(Double.self, forKey: .lineSpacing) ?? 1.1
@@ -65,6 +66,7 @@ struct Config: Codable {
         try c.encode(env, forKey: .env)
         try c.encode(modelBaseUrl, forKey: .modelBaseUrl)
         try c.encode(modelName, forKey: .modelName)
+        try c.encode(modelApiKey, forKey: .modelApiKey)
         try c.encode(themeName, forKey: .themeName)
         try c.encode(cursorStyle, forKey: .cursorStyle)
         try c.encode(lineSpacing, forKey: .lineSpacing)
@@ -234,8 +236,9 @@ func vnodeCwd(_ pid: Int32) -> String? {
 
 final class TermPane: NSView {
     let term = AgentTermView(frame: .zero)
-    private let crt = CRTOverlay(frame: .zero)
     private let badge = NSTextField(labelWithString: "")
+    private let mark = PipBoyMark(frame: NSRect(x: 10, y: 10, width: PipBoyMark.side, height: PipBoyMark.side))
+    private let crt = CRTOverlay(frame: .zero)
     private var started = false
     private(set) var directory = FileManager.default.currentDirectoryPath
 
@@ -253,9 +256,9 @@ final class TermPane: NSView {
         badge.textColor = NSColor.systemOrange
         badge.drawsBackground = false
         badge.isBezeled = false
-        badge.isEditable = false
-        badge.isHidden = true
         addSubview(badge)
+        addSubview(mark)
+        badge.isHidden = true
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -405,6 +408,7 @@ final class TermPane: NSView {
         super.layout()
         term.frame = bounds
         crt.frame = bounds
+        mark.frame = NSRect(x: 12, y: 12, width: PipBoyMark.side, height: PipBoyMark.side)
         badge.sizeToFit()
         let size = badge.frame.size
         badge.frame = NSRect(x: bounds.width - size.width - 8, y: bounds.height - size.height - 6,
@@ -954,6 +958,15 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func wireDock() {
         shell.dock.setModel(cfg.modelName.isEmpty ? "未配置模型" : cfg.modelName)
+        shell.dock.setModelFields(url: cfg.modelBaseUrl, name: cfg.modelName, key: cfg.modelApiKey)
+        shell.dock.onSaveModel = { [weak self] url, name, key in
+            guard let self else { return }
+            self.cfg.modelBaseUrl = url
+            self.cfg.modelName = name
+            self.cfg.modelApiKey = key
+            self.cfg.save()
+            self.shell.dock.setModel(name.isEmpty ? "未配置模型" : name)
+        }
         shell.dock.onSend = { [weak self] in self?.submitComposer(forceQueue: false) }
         shell.dock.onQueue = { [weak self] in self?.queueComposer() }
         shell.dock.onAttach = { [weak self] in self?.attachScreen() }
@@ -1559,6 +1572,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         host.sidebar.onTabMenu = { [weak self] id, view in self?.popTabMenu(id, view) }
         host.sidebar.onRenameTab = { [weak self] id, name in self?.renameTab(id, to: name) }
         host.sidebar.onReorder = { [weak self] key, index in self?.moveGroup(key, to: index) }
+        host.sidebar.onCollapseSidebar = { [weak host] in host?.setSidebarVisible(false) }
     }
 
     @objc func toggleSidebar() {

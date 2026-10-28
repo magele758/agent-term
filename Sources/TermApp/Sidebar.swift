@@ -18,11 +18,13 @@ final class TabSidebar: NSView {
     var onTabMenu: ((ObjectIdentifier, NSView) -> Void)?
     var onRenameTab: ((ObjectIdentifier, String) -> Void)?
     var onReorder: ((String, Int) -> Void)?
+    var onCollapseSidebar: (() -> Void)?
 
     private let plate = NSVisualEffectView()
     private let header = NSTextField(labelWithString: "标签")
     private let filter = NSButton()
     private let addGroup = NSButton()
+    private let collapse = NSButton()
     private let add = NSButton()
     private let list = FlippedView(frame: .zero)
     private var rows: [SideRow] = []
@@ -46,9 +48,13 @@ final class TabSidebar: NSView {
         configureIcon(filter, "line.3.horizontal.decrease", #selector(filterClick))
         configureIcon(addGroup, "folder.badge.plus", #selector(addGroupClick))
         configureIcon(add, "plus", #selector(addClick))
+        configureIcon(collapse, "sidebar.left", #selector(collapseClick))
+        collapse.contentTintColor = .white
+        collapse.toolTip = "收起侧栏"
         addGroup.toolTip = "新建分组"
         add.toolTip = "新建标签"
         addSubview(filter)
+        addSubview(collapse)
         addSubview(addGroup)
         addSubview(add)
         addSubview(list)
@@ -114,7 +120,8 @@ final class TabSidebar: NSView {
         plate.frame = bounds
         super.layout()
         let top = Glass.titleInset(in: self) + 8
-        header.frame = NSRect(x: 16, y: bounds.height - top - 16, width: 72, height: 16)
+        collapse.frame = NSRect(x: 8, y: bounds.height - top - 18, width: 22, height: 22)
+        header.frame = NSRect(x: 34, y: bounds.height - top - 16, width: 72, height: 16)
         add.frame = NSRect(x: bounds.width - 32, y: bounds.height - top - 18, width: 22, height: 22)
         addGroup.frame = NSRect(x: bounds.width - 56, y: bounds.height - top - 18, width: 22, height: 22)
         filter.frame = NSRect(x: bounds.width - 80, y: bounds.height - top - 18, width: 22, height: 22)
@@ -165,6 +172,7 @@ final class TabSidebar: NSView {
     @objc private func addClick() { onNew?() }
     @objc private func addGroupClick() { onNewGroup?() }
     @objc private func filterClick() { onFilter?(filter) }
+    @objc private func collapseClick() { onCollapseSidebar?() }
 }
 
 private final class GroupHeader: NSView, NSTextFieldDelegate {
