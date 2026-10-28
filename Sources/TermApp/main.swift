@@ -81,7 +81,9 @@ struct Config: Codable {
         }
         var cfg = (try? JSONDecoder().decode(Config.self, from: data)) ?? Config()
         let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        if let legacy = obj?["modelApiKey"] as? String {
+        if Keychain.enabled == false {
+            cfg.modelApiKey = (obj?["modelApiKey"] as? String) ?? Keychain.load()
+        } else if let legacy = obj?["modelApiKey"] as? String {
             Keychain.save(legacy)
             cfg.modelApiKey = legacy
             cfg.save()
@@ -100,15 +102,21 @@ struct Config: Codable {
 }
 
 enum Keychain {
+    // Off while the app is an unsigned debug binary. Each rebuild is a new
+    // app to the login keychain, so macOS asks for the login password again.
+    // Turn this back on before the release commit.
+    static let enabled = false
     static let service = "agent-term"
     static let account = "modelApiKey"
 
     static func load() -> String {
+        if enabled == false { return envFallback() }
         if let key = readSilent(), key.isEmpty == false { return key }
         return envFallback()
     }
 
     static func save(_ value: String) {
+        if enabled == false { return }
         let data = Data(value.utf8)
         var base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -225,7 +233,7 @@ func vnodeCwd(_ pid: Int32) -> String? {
 }
 
 final class TermPane: NSView {
-    let term = LocalProcessTerminalView(frame: .zero)
+    let term = AgentTermView(frame: .zero)
     private let crt = CRTOverlay(frame: .zero)
     private let badge = NSTextField(labelWithString: "")
     private var started = false
@@ -240,6 +248,7 @@ final class TermPane: NSView {
         addSubview(term)
         addSubview(crt)
         crt.bind(term)
+        term.directory = { [weak self] in self?.liveDirectory() ?? FileManager.default.currentDirectoryPath }
         badge.font = NSFont.systemFont(ofSize: 11, weight: .medium)
         badge.textColor = NSColor.systemOrange
         badge.drawsBackground = false
@@ -272,17 +281,32 @@ final class TermPane: NSView {
         term.selectedTextForegroundColor = color(fg)
         term.optionAsMetaKey = cfg.optionAsMeta
         term.lineSpacing = CGFloat(cfg.lineSpacing)
-        if let style = CursorStyle(tagName: cfg.cursorStyle) {
+        let crtOn = ["辐射", "琥珀", "蓝"].contains(cfg.themeName)
+        if crtOn {
+            term.terminal.setCursorStyle(.steadyBlock)
+        } else if let style = CursorStyle(tagName: cfg.cursorStyle) {
             term.terminal.setCursorStyle(style)
         }
-        let crtOn = ["辐射", "琥珀", "蓝"].contains(cfg.themeName)
         crt.setEnabled(crtOn)
+        layer?.isOpaque = false
+        layer?.backgroundColor = NSColor.clear.cgColor
         if crtOn {
             crt.setBackground(color(bg))
             crt.setForeground(color(fg))
             try? term.setUseMetal(false)
+            term.alphaValue = 1
+            term.layer?.opacity = 0
+            term.layer?.isOpaque = true
+            term.backgroundOpacity = 1
             layer?.borderWidth = 0
+        } else if window != nil {
+            term.alphaValue = 1
+            term.layer?.opacity = 1
+            term.backgroundOpacity = min(cfg.opacity, 0.78)
+            term.layer?.isOpaque = false
+            enableGpu()
         }
+        term.needsDisplay = true
         layer?.borderColor = (crtOn
             ? NSColor(srgbRed: 0.02, green: 0.05, blue: 0.02, alpha: 1)
             : NSColor.systemBlue).cgColor
@@ -326,8 +350,8 @@ final class TermPane: NSView {
             try term.setUseMetal(true)
             term.metalBufferingMode = .perRowPersistent
         } catch {
-            FileHandle.standardError.write(Data("metal: \(error)\n".utf8))
         }
+        term.layer?.isOpaque = false
     }
 
     func screenText() -> String {
@@ -338,6 +362,45 @@ final class TermPane: NSView {
                             end: Position(col: grid.cols - 1, row: grid.rows - 1))
     }
 
+    private var findBar: FindBar?
+    private var findForward = true
+
+    func toggleFind() {
+        if findBar == nil {
+            let bar = FindBar(frame: NSRect(x: 8, y: bounds.height - 40, width: 372, height: 36))
+            bar.onFind = { [weak self] text, forward in self?.runFind(text, forward: forward) }
+            bar.onClose = { [weak self] in self?.hideFind() }
+            addSubview(bar)
+            findBar = bar
+        }
+        guard let findBar else { return }
+        findBar.isHidden = false
+        window?.makeFirstResponder(findBar.field)
+    }
+
+    func findAgain(forward: Bool) {
+        guard let findBar, findBar.field.stringValue.isEmpty == false else {
+            toggleFind()
+            return
+        }
+        runFind(findBar.field.stringValue, forward: forward)
+    }
+
+    private func hideFind() {
+        term.clearSearch()
+        findBar?.isHidden = true
+        focus()
+    }
+
+    private func runFind(_ text: String, forward: Bool) {
+        let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.isEmpty == false else { return }
+        let hit = forward ? term.findNext(query) : term.findPrevious(query)
+        let summary = term.searchMatchSummary(query)
+        findBar?.status.stringValue = hit ? "\(summary.index)/\(summary.total)" : "无"
+        findForward = forward
+    }
+
     override func layout() {
         super.layout()
         term.frame = bounds
@@ -346,6 +409,9 @@ final class TermPane: NSView {
         let size = badge.frame.size
         badge.frame = NSRect(x: bounds.width - size.width - 8, y: bounds.height - size.height - 6,
                              width: size.width, height: size.height)
+        if let findBar, findBar.isHidden == false {
+            findBar.frame = NSRect(x: 8, y: bounds.height - 44, width: min(372, bounds.width - 16), height: 36)
+        }
     }
 }
 
@@ -440,9 +506,19 @@ final class SplitView: NSView {
         let gap: CGFloat = 2
         let r = clampedRatio
         if sideBySide {
-            let w = (bounds.width - gap) * r
-            first.frame = NSRect(x: 0, y: 0, width: w, height: bounds.height)
-            second.frame = NSRect(x: w + gap, y: 0, width: bounds.width - w - gap, height: bounds.height)
+            if first.isHidden {
+                second.frame = bounds
+            } else if second.isHidden {
+                first.frame = bounds
+            } else {
+                let w = (bounds.width - gap) * r
+                first.frame = NSRect(x: 0, y: 0, width: w, height: bounds.height)
+                second.frame = NSRect(x: w + gap, y: 0, width: bounds.width - w - gap, height: bounds.height)
+            }
+        } else if first.isHidden {
+            second.frame = bounds
+        } else if second.isHidden {
+            first.frame = bounds
         } else {
             let top = (bounds.height - gap) * r
             first.frame = NSRect(x: 0, y: bounds.height - top, width: bounds.width, height: top)
@@ -617,14 +693,37 @@ final class FlippedView: NSView {
 
 final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var cfg = Config.load()
-    let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 1280, height: 760),
-        styleMask: [.titled, .closable, .miniaturizable, .resizable],
-        backing: .buffered, defer: false)
+    var window: NSWindow!
     private var monitor: Any?
     private var settings: Settings?
     private let palette = CommandPalette()
     private var shell: ShellView!
+    private var closedPanes: [TermPane] = []
+    private var closedDirs: [String] = []
+    private var zoomHidden: [NSView] = []
+    private var quick: NSPanel?
+    private enum GroupMode { case none, project, date }
+    private enum OrderMode { case created, updated }
+    private var groupMode: GroupMode = .project
+    private var orderMode: OrderMode = .created
+    private var collapsedGroups = Set<String>()
+    private var groupOrder: [String] = []
+    private var groupAliases: [String: String] = [:]
+    private struct ShelfPane {
+        let id: ObjectIdentifier
+        weak var pane: TermPane?
+        weak var win: NSWindow?
+        var groupKey: String
+        var title: String
+    }
+    private var shelf: [ShelfPane] = []
+    private var createdAt: [ObjectIdentifier: Date] = [:]
+    private var updatedAt: [ObjectIdentifier: Date] = [:]
+    private let tabGroups = TabGroupStore()
+    private var sessionToken: [ObjectIdentifier: UUID] = [:]
+    private var customTitles: [ObjectIdentifier: String] = [:]
+    private var pinnedSessions = Set<ObjectIdentifier>()
+    private var pinnedGroups = Set<UUID>()
     private var turns: [(String, String)] = []
     private var promptQueue: [String] = []
     private var attachment: String?
@@ -639,25 +738,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private static var asking = Set<String>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        window.isOpaque = cfg.opacity >= 1
-        window.backgroundColor = cfg.opacity >= 1 ? .black : .clear
-        window.title = "agent-term"
-        window.delegate = self
-        let shell = ShellView(frame: window.contentView!.bounds)
-        shell.autoresizingMask = [.width, .height]
-        window.contentView!.addSubview(shell)
-        self.shell = shell
-        wireDock()
-        let pane = TermPane(frame: shell.host.bounds)
-        shell.host.setRoot(pane)
+        _ = openTerminal(directory: nil, tabbed: false)
         window.center()
-        window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        window.layoutIfNeeded()
-        pane.start(cfg)
-        pane.enableGpu()
-        pane.focus()
-        refreshHint()
         buildMenu()
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             self?.handle(event) ?? event
@@ -665,13 +748,40 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        agentTask?.terminate()
-        if let monitor { NSEvent.removeMonitor(monitor) }
-        NSApplication.shared.terminate(nil)
+        guard let win = notification.object as? NSWindow else { return }
+        if win.identifier?.rawValue == "quick-terminal" { return }
+        if win.identifier?.rawValue != "agent-term" { return }
+        forgetSession(win)
+        if let dir = focusedPane(in: win)?.liveDirectory() { closedDirs.append(dir) }
+        let others = NSApp.windows.filter { $0 !== win && $0.identifier?.rawValue == "agent-term" }
+        if others.isEmpty {
+            agentTask?.terminate()
+            closedPanes.forEach { $0.term.terminate() }
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            NSApplication.shared.terminate(nil)
+            return
+        }
+        if win === window { adopt(others[0]) }
+        reloadSidebars()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        guard let win = notification.object as? NSWindow else { return }
+        if win.identifier?.rawValue == "agent-term" || win.identifier?.rawValue == "quick-terminal" {
+            adopt(win)
+            if win.identifier?.rawValue == "agent-term" {
+                noteSession(win)
+                reloadSidebars()
+            }
+        }
     }
 
     private func handle(_ event: NSEvent) -> NSEvent? {
-        if let source = event.window, source !== window { return event }
+        if let source = event.window {
+            let id = source.identifier?.rawValue
+            if id == "agent-term" || id == "quick-terminal" { adopt(source) }
+            else if source !== window { return event }
+        }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let key = event.charactersIgnoringModifiers ?? ""
         guard flags.contains(.command) else { return event }
@@ -682,6 +792,10 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return nil
         }
         if key == "d" || key == "w" || key == "," || key == "k" { return event }
+        if flags == .command, let n = Int(key), (1...9).contains(n), window.firstResponder is NSTextView == false {
+            jumpSession(n)
+            return nil
+        }
         if key == "p" && flags.contains(.shift) { return event }
         if key == "=" || key == "+" || key == "-" || key == "0" { return event }
         if flags.contains(.option) {
@@ -740,26 +854,73 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             themes.addItem(it)
         }
         view.addItem(themeItem)
+        view.addItem(.separator())
+        view.addItem(item("查找", #selector(showFind), "f"))
+        view.addItem(item("查找下一个", #selector(findNextItem), "g"))
+        let prev = item("查找上一个", #selector(findPreviousItem), "g")
+        prev.keyEquivalentModifierMask = [.command, .shift]
+        view.addItem(prev)
+        let full = item("进入全屏", #selector(toggleFullScreen), "f")
+        full.keyEquivalentModifierMask = [.command, .control]
+        view.addItem(full)
+
+        let editItem = NSMenuItem()
+        main.addItem(editItem)
+        let edit = NSMenu(title: "编辑")
+        editItem.submenu = edit
+        edit.addItem(responderItem("拷贝", #selector(NSText.copy(_:)), "c"))
+        edit.addItem(responderItem("粘贴", #selector(NSText.paste(_:)), "v"))
+        edit.addItem(responderItem("全选", #selector(NSText.selectAll(_:)), "a"))
 
         let winItem = NSMenuItem()
         main.addItem(winItem)
         let win = NSMenu(title: "窗口")
         winItem.submenu = win
+        win.addItem(item("新建窗口", #selector(newWindow), "n"))
+        win.addItem(item("新建标签", #selector(newTab), "t"))
+        win.addItem(item("新建分组", #selector(newNamedGroup), ""))
+        let side = item("标签侧栏", #selector(toggleSidebar), "l")
+        side.keyEquivalentModifierMask = [.command, .shift]
+        win.addItem(side)
+        let reopen = item("重新打开", #selector(reopenClosed), "t")
+        reopen.keyEquivalentModifierMask = [.command, .shift]
+        win.addItem(reopen)
+        let closeWin = item("关闭窗口", #selector(closeWindow), "w")
+        closeWin.keyEquivalentModifierMask = [.command, .shift]
+        win.addItem(closeWin)
+        win.addItem(.separator())
         win.addItem(item("左右分屏", #selector(splitSideBySide), "d"))
         let stack = item("上下分屏", #selector(splitStacked), "d")
         stack.keyEquivalentModifierMask = [.command, .shift]
         win.addItem(stack)
         win.addItem(item("关闭面板", #selector(closePane), "w"))
+        let zoomPane = item("缩放面板", #selector(togglePaneZoom), "\r")
+        zoomPane.keyEquivalentModifierMask = [.command, .shift]
+        win.addItem(zoomPane)
+        let equal = item("均分面板", #selector(equalizeSplits), "=")
+        equal.keyEquivalentModifierMask = [.command, .control]
+        win.addItem(equal)
+        win.addItem(item("下一个面板", #selector(focusNextPane), "]"))
+        win.addItem(item("上一个面板", #selector(focusPrevPane), "["))
         win.addItem(arrowItem("焦点左", #selector(focusLeft), NSLeftArrowFunctionKey))
         win.addItem(arrowItem("焦点右", #selector(focusRight), NSRightArrowFunctionKey))
         win.addItem(arrowItem("焦点下", #selector(focusDown), NSDownArrowFunctionKey))
         win.addItem(arrowItem("焦点上", #selector(focusUp), NSUpArrowFunctionKey))
+        let quickItem = item("快速终端", #selector(toggleQuick), "`")
+        quickItem.keyEquivalentModifierMask = [.command, .control]
+        win.addItem(quickItem)
         NSApp.mainMenu = main
     }
 
     private func item(_ title: String, _ action: Selector, _ key: String) -> NSMenuItem {
         let it = NSMenuItem(title: title, action: action, keyEquivalent: key)
         it.target = self
+        return it
+    }
+
+    private func responderItem(_ title: String, _ action: Selector, _ key: String) -> NSMenuItem {
+        let it = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        it.target = nil
         return it
     }
 
@@ -1044,11 +1205,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func applyLook() {
-        let theme = ThemeCatalog.find(cfg.themeName)
-        let bg = color(theme?.background ?? cfg.background)
-        window.isOpaque = cfg.opacity >= 1
-        window.backgroundColor = cfg.opacity >= 1 ? bg : .clear
-        shell.host.layer?.backgroundColor = bg.cgColor
+        Glass.install(window)
+        shell.host.layer?.backgroundColor = NSColor.clear.cgColor
         for pane in allPanes() { pane.apply(cfg) }
         refreshHint()
     }
@@ -1137,10 +1295,16 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func closeFocused() {
         guard let pane = focusedPane() else { return }
-        pane.term.terminate()
-        guard let split = pane.superview as? SplitView else { window.close(); return }
+        closedDirs.append(pane.liveDirectory())
+        guard let split = pane.superview as? SplitView else {
+            pane.removeFromSuperview()
+            stash(pane)
+            window.close()
+            return
+        }
         let keep = split.first === pane ? split.second : split.first
         pane.removeFromSuperview()
+        stash(pane)
         if let parent = split.superview as? SplitView {
             parent.collapse(split, keep: keep)
         } else if let host = split.superview as? TerminalHost {
@@ -1154,6 +1318,13 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.contentView!.layoutSubtreeIfNeeded()
         firstPane(in: keep)?.focus()
         markFocus()
+    }
+
+    private func stash(_ pane: TermPane) {
+        closedPanes.append(pane)
+        if closedPanes.count > 6 {
+            closedPanes.removeFirst().term.terminate()
+        }
     }
 
     private func focus(dx: CGFloat, dy: CGFloat) {
@@ -1170,22 +1341,27 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         markFocus()
     }
 
-    private func focusedPane() -> TermPane? {
-        var view = window.firstResponder as? NSView
+    private func focusedPane() -> TermPane? { focusedPane(in: window) }
+
+    private func focusedPane(in win: NSWindow) -> TermPane? {
+        var view = win.firstResponder as? NSView
         while let cur = view {
-            if let pane = cur as? TermPane, pane.term.isDescendant(of: pane) { return pane }
+            if let pane = cur as? TermPane { return pane }
             view = cur.superview
         }
-        return allPanes().first
+        return panes(in: win).first
     }
 
-    private func allPanes() -> [TermPane] {
+    private func allPanes() -> [TermPane] { panes(in: window) }
+
+    private func panes(in win: NSWindow) -> [TermPane] {
+        guard let root = win.contentView else { return [] }
         var found: [TermPane] = []
         func walk(_ view: NSView) {
             if let pane = view as? TermPane { found.append(pane) }
             view.subviews.forEach(walk)
         }
-        walk(window.contentView!)
+        walk(root)
         return found
     }
 
@@ -1206,6 +1382,614 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             pane.markFocused(pane === cur)
             pane.setBadge(pane === cur ? badgeText : nil)
         }
+        if let dir = cur?.liveDirectory() {
+            window.representedURL = URL(fileURLWithPath: dir)
+            window.title = URL(fileURLWithPath: dir).lastPathComponent
+        }
+        reloadSidebars()
+    }
+
+    private func adopt(_ win: NSWindow) {
+        guard let host = win.contentView?.subviews.compactMap({ $0 as? ShellView }).first else { return }
+        window = win
+        shell = host
+    }
+
+    @discardableResult
+    private func openTerminal(directory: String?, tabbed: Bool) -> NSWindow {
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1280, height: 760),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered, defer: false)
+        win.title = "agent-term"
+        win.identifier = NSUserInterfaceItemIdentifier("agent-term")
+        win.tabbingMode = .disallowed
+        win.delegate = self
+        Glass.install(win)
+        let host = ShellView(frame: win.contentView!.bounds)
+        host.autoresizingMask = [.width, .height]
+        host.showSidebar = true
+        win.contentView!.addSubview(host)
+        if tabbed, let current = NSApp.keyWindow, current.identifier?.rawValue == "agent-term" {
+            win.setFrame(current.frame, display: false)
+        }
+        adopt(win)
+        wireDock()
+        wireSidebar(host)
+        let pane = TermPane(frame: host.host.bounds)
+        host.host.setRoot(pane)
+        win.makeKeyAndOrderFront(nil)
+        adopt(win)
+        win.layoutIfNeeded()
+        pane.start(cfg, directory: directory ?? focusedPane(in: win)?.liveDirectory())
+        pane.enableGpu()
+        pane.focus()
+        refreshHint()
+        noteSession(win)
+        reloadSidebars()
+        return win
+    }
+
+    @objc func newWindow() { _ = openTerminal(directory: focusedPane()?.liveDirectory(), tabbed: false) }
+    @objc func newTab() { _ = openTerminal(directory: focusedPane()?.liveDirectory(), tabbed: true) }
+    @objc func closeWindow() { window.close() }
+    @objc func showFind() { focusedPane()?.toggleFind() }
+    @objc func findNextItem() { focusedPane()?.findAgain(forward: true) }
+    @objc func findPreviousItem() { focusedPane()?.findAgain(forward: false) }
+    @objc func toggleFullScreen() { window.toggleFullScreen(nil) }
+
+    @objc func focusNextPane() { cyclePane(forward: true) }
+    @objc func focusPrevPane() { cyclePane(forward: false) }
+
+    private func cyclePane(forward: Bool) {
+        let panes = allPanes()
+        guard panes.isEmpty == false else { return }
+        let index = panes.firstIndex { $0 === focusedPane() } ?? 0
+        let next = (index + (forward ? 1 : panes.count - 1)) % panes.count
+        panes[next].focus()
+        markFocus()
+    }
+
+    @objc func equalizeSplits() {
+        func walk(_ view: NSView) {
+            if let split = view as? SplitView {
+                split.ratio = 0.5
+                split.needsLayout = true
+            }
+            view.subviews.forEach(walk)
+        }
+        if let root = window.contentView { walk(root) }
+        window.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    @objc func togglePaneZoom() {
+        if zoomHidden.isEmpty == false {
+            zoomHidden.forEach { $0.isHidden = false }
+            zoomHidden.removeAll()
+            window.contentView?.layoutSubtreeIfNeeded()
+            return
+        }
+        guard let pane = focusedPane() else { return }
+        var node: NSView = pane
+        while let parent = node.superview as? SplitView {
+            let inFirst = parent.first === node || node.isDescendant(of: parent.first)
+            let sib = inFirst ? parent.second : parent.first
+            if sib.isHidden == false {
+                sib.isHidden = true
+                zoomHidden.append(sib)
+            }
+            node = parent
+        }
+        window.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    @objc func reopenClosed() {
+        if let pane = closedPanes.popLast() {
+            if let cur = focusedPane(), let parent = cur.superview as? SplitView {
+                parent.divide(cur, with: pane, sideBySide: true)
+            } else if let cur = focusedPane(), let host = cur.superview as? TerminalHost {
+                host.setRoot(SplitView(first: cur, second: pane, sideBySide: true))
+            } else {
+                shell.host.setRoot(pane)
+            }
+            window.contentView?.layoutSubtreeIfNeeded()
+            pane.focus()
+            markFocus()
+            return
+        }
+        guard let dir = closedDirs.popLast() else { return }
+        _ = openTerminal(directory: dir, tabbed: true)
+    }
+
+    @objc func toggleQuick() {
+        if let quick, quick.isVisible {
+            quick.orderOut(nil)
+            NSApp.windows.last { $0.identifier?.rawValue == "agent-term" }?.makeKeyAndOrderFront(nil)
+            return
+        }
+        if quick == nil {
+            let panel = NSPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 900, height: 420),
+                styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
+                backing: .buffered, defer: false)
+            panel.title = "快速终端"
+            panel.identifier = NSUserInterfaceItemIdentifier("quick-terminal")
+            panel.level = .floating
+            panel.isFloatingPanel = true
+            panel.hidesOnDeactivate = false
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.delegate = self
+            Glass.install(panel)
+            let host = ShellView(frame: panel.contentView!.bounds)
+            host.autoresizingMask = [.width, .height]
+            host.showSidebar = false
+            panel.contentView!.addSubview(host)
+            adopt(panel)
+            wireDock()
+            let pane = TermPane(frame: host.host.bounds)
+            host.host.setRoot(pane)
+            if let screen = NSScreen.main?.visibleFrame {
+                panel.setFrame(NSRect(x: screen.midX - 450, y: screen.maxY - 440, width: 900, height: 420), display: false)
+            }
+            panel.layoutIfNeeded()
+            pane.start(cfg, directory: focusedPane()?.liveDirectory())
+            pane.enableGpu()
+            quick = panel
+        }
+        quick?.makeKeyAndOrderFront(nil)
+        if let quick { adopt(quick) }
+        panes(in: quick!).first?.focus()
+    }
+
+    private func wireSidebar(_ host: ShellView) {
+        host.sidebar.onNew = { [weak self] in self?.newTab() }
+        host.sidebar.onNewGroup = { [weak self] in self?.newNamedGroup() }
+        host.sidebar.onSelect = { [weak self] id in self?.selectSession(id) }
+        host.sidebar.onClose = { [weak self] id in self?.closeSession(id) }
+        host.sidebar.onFilter = { [weak self] view in self?.popSidebarMenu(view) }
+        host.sidebar.onToggle = { [weak self] key in
+            guard let self else { return }
+            if self.collapsedGroups.contains(key) { self.collapsedGroups.remove(key) }
+            else { self.collapsedGroups.insert(key) }
+            self.reloadSidebars()
+        }
+        host.sidebar.onRenameGroup = { [weak self] key, name in self?.renameGroup(key, to: name) }
+        host.sidebar.onNewInGroup = { [weak self] key in self?.newInGroup(key) }
+        host.sidebar.onGroupMenu = { [weak self] key, view in self?.popGroupMenu(key, view) }
+        host.sidebar.onTabMenu = { [weak self] id, view in self?.popTabMenu(id, view) }
+        host.sidebar.onRenameTab = { [weak self] id, name in self?.renameTab(id, to: name) }
+        host.sidebar.onReorder = { [weak self] key, index in self?.moveGroup(key, to: index) }
+    }
+
+    @objc func toggleSidebar() {
+        shell.setSidebarVisible(shell.showSidebar == false)
+    }
+
+    private func noteSession(_ win: NSWindow) {
+        let id = ObjectIdentifier(win)
+        if createdAt[id] == nil { createdAt[id] = Date() }
+        updatedAt[id] = Date()
+        if sessionToken[id] == nil { sessionToken[id] = UUID() }
+    }
+
+    private func forgetSession(_ win: NSWindow) {
+        let id = ObjectIdentifier(win)
+        if let token = sessionToken.removeValue(forKey: id) {
+            tabGroups.remove(token)
+        }
+        customTitles.removeValue(forKey: id)
+        pinnedSessions.remove(id)
+    }
+
+    private func sessions() -> [NSWindow] {
+        NSApp.windows.filter { $0.identifier?.rawValue == "agent-term" }
+    }
+
+    private func selectSession(_ id: ObjectIdentifier) {
+        if let item = shelf.first(where: { $0.id == id }), let pane = item.pane, let win = item.win {
+            collapsedGroups.remove(item.groupKey)
+            win.makeKeyAndOrderFront(nil)
+            adopt(win)
+            host(of: win)?.show(pane)
+            pane.focus()
+            reloadSidebars()
+            return
+        }
+        guard let win = sessions().first(where: { ObjectIdentifier($0) == id }) else { return }
+        if let token = sessionToken[id], let gid = tabGroups.groupID(of: token) {
+            collapsedGroups.remove("group:\(gid)")
+        }
+        win.makeKeyAndOrderFront(nil)
+        adopt(win)
+        host(of: win)?.showFirst()
+        focusedPane()?.focus()
+        reloadSidebars()
+    }
+
+    private func closeSession(_ id: ObjectIdentifier) {
+        if let i = shelf.firstIndex(where: { $0.id == id }) {
+            shelf[i].pane?.removeFromSuperview()
+            if let win = shelf[i].win { host(of: win)?.showFirst() }
+            shelf.remove(at: i)
+            reloadSidebars()
+            return
+        }
+        sessions().first { ObjectIdentifier($0) == id }?.close()
+    }
+
+    private func host(of win: NSWindow) -> TerminalHost? {
+        win.contentView?.subviews.compactMap { $0 as? ShellView }.first?.host
+    }
+
+    private func appendShelf(in win: NSWindow, key: String, rows: inout [SideRow], index: inout Int) {
+        for item in shelf where item.win === win && item.groupKey == key && item.pane != nil {
+            let title = customTitles[item.id] ?? item.title
+            let active = item.pane != nil && host(of: win)?.shown === item.pane
+            rows.append(.tab(id: item.id, title: title, index: index, active: active, pinned: false))
+            index += 1
+        }
+    }
+
+    private func jumpSession(_ n: Int) {
+        let ids = sidebarRows().compactMap { row -> ObjectIdentifier? in
+            if case let .tab(id, _, _, _, _) = row { return id }
+            return nil
+        }
+        let index = n == 9 ? ids.count - 1 : n - 1
+        guard ids.indices.contains(index) else { return }
+        selectSession(ids[index])
+    }
+
+    private func popSidebarMenu(_ anchor: NSView) {
+        let menu = NSMenu()
+        menu.addItem(section("分组"))
+        menu.addItem(check("不分组", groupMode == .none, #selector(groupNone)))
+        menu.addItem(check("按项目", groupMode == .project, #selector(groupProject)))
+        menu.addItem(check("按日期", groupMode == .date, #selector(groupDate)))
+        menu.addItem(.separator())
+        menu.addItem(section("排序"))
+        menu.addItem(check("创建时间", orderMode == .created, #selector(orderCreated)))
+        menu.addItem(check("最近使用", orderMode == .updated, #selector(orderUpdated)))
+        menu.addItem(.separator())
+        menu.addItem(item("新建分组", #selector(newNamedGroup), ""))
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: anchor)
+    }
+
+    private func section(_ title: String) -> NSMenuItem {
+        let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        it.isEnabled = false
+        return it
+    }
+
+    private func check(_ title: String, _ on: Bool, _ action: Selector) -> NSMenuItem {
+        let it = item(title, action, "")
+        it.state = on ? .on : .off
+        return it
+    }
+
+    @objc private func groupNone() { groupMode = .none; reloadSidebars() }
+    @objc private func groupProject() { groupMode = .project; reloadSidebars() }
+    @objc private func groupDate() { groupMode = .date; reloadSidebars() }
+    @objc private func orderCreated() { orderMode = .created; reloadSidebars() }
+    @objc private func orderUpdated() { orderMode = .updated; reloadSidebars() }
+
+    @objc private func newNamedGroup() {
+        groupMode = .none
+        let id = tabGroups.create(name: tabGroups.uniqueName("分组"), member: nil)
+        let key = "group:\(id)"
+        reloadSidebars()
+        visibleSidebars().forEach { $0.beginRename(key) }
+    }
+
+    private func renameGroup(_ key: String, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else { return }
+        if let id = groupUUID(key) {
+            _ = tabGroups.rename(id, to: trimmed)
+        } else {
+            groupAliases[key] = trimmed
+        }
+        reloadSidebars()
+    }
+
+    private func moveGroup(_ key: String, to index: Int) {
+        if let id = groupUUID(key) {
+            tabGroups.move(id, to: index)
+        } else {
+            var keys = orderedKeys(currentGroupKeys())
+            keys.removeAll { $0 == key }
+            keys.insert(key, at: min(max(0, index), keys.count))
+            groupOrder = keys
+        }
+        reloadSidebars()
+    }
+
+    private func orderedKeys(_ keys: [String]) -> [String] {
+        let known = groupOrder.filter { keys.contains($0) }
+        let rest = keys.filter { groupOrder.contains($0) == false }.sorted()
+        return known + rest
+    }
+
+    private func groupTitle(_ key: String) -> String {
+        groupAliases[key] ?? key
+    }
+
+    private func currentGroupKeys() -> [String] {
+        var keys: [String] = []
+        for win in sessions() {
+            let key = groupKey(win)
+            if keys.contains(key) == false { keys.append(key) }
+        }
+        return keys
+    }
+
+    private func newInGroup(_ key: String) {
+        let dir: String?
+        if let id = groupUUID(key) {
+            dir = directory(of: liveMembers(id).first) ?? focusedPane()?.liveDirectory()
+        } else if groupMode == .project {
+            dir = directory(of: sessions().first { groupKey($0) == key })
+        } else {
+            dir = focusedPane()?.liveDirectory()
+        }
+        shell.host.layoutSubtreeIfNeeded()
+        let pane = TermPane(frame: shell.host.bounds)
+        shell.host.addPane(pane)
+        pane.start(cfg, directory: dir)
+        pane.enableGpu()
+        pane.focus()
+        let name = dir.flatMap { URL(fileURLWithPath: $0).lastPathComponent }.flatMap { $0.isEmpty ? nil : $0 } ?? "终端"
+        shelf.append(ShelfPane(id: ObjectIdentifier(pane), pane: pane, win: window, groupKey: key, title: name))
+        collapsedGroups.remove(key)
+        reloadSidebars()
+    }
+
+    private func popGroupMenu(_ key: String, _ anchor: NSView) {
+        guard let id = groupUUID(key) else { return }
+        let menu = NSMenu()
+        menu.addItem(actionItem("重命名分组") { [weak self] in
+            self?.visibleSidebars().forEach { $0.beginRename(key) }
+        })
+        menu.addItem(actionItem("在此分组新建标签") { [weak self] in self?.newInGroup(key) })
+        menu.addItem(actionItem("删除分组") { [weak self] in
+            self?.tabGroups.delete(id)
+            self?.pinnedGroups.remove(id)
+            self?.reloadSidebars()
+        })
+        menu.addItem(actionItem(pinnedGroups.contains(id) ? "取消固定" : "固定分组") { [weak self] in
+            guard let self else { return }
+            if self.pinnedGroups.contains(id) { self.pinnedGroups.remove(id) }
+            else { self.pinnedGroups.insert(id) }
+            self.reloadSidebars()
+        })
+        menu.addItem(actionItem("关闭分组") { [weak self] in
+            self?.liveMembers(id).forEach { $0.close() }
+        })
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: anchor)
+        menuActions.removeAll()
+    }
+
+    private func popTabMenu(_ id: ObjectIdentifier, _ anchor: NSView) {
+        guard let win = sessions().first(where: { ObjectIdentifier($0) == id }) else { return }
+        noteSession(win)
+        guard let token = sessionToken[id] else { return }
+        let menu = NSMenu()
+        menu.addItem(actionItem("重命名") { [weak self] in
+            self?.visibleSidebars().forEach { $0.beginRenameTab(id) }
+        })
+        menu.addItem(actionItem("新建分组并加入") { [weak self] in
+            guard let self else { return }
+            self.groupMode = .none
+            let gid = self.tabGroups.create(name: self.tabGroups.uniqueName("分组"), member: token)
+            self.reloadSidebars()
+            self.visibleSidebars().forEach { $0.beginRename("group:\(gid)") }
+        })
+        let move = NSMenuItem(title: "移到分组", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for group in tabGroups.groups {
+            let gid = group.id
+            let item = actionItem(group.name) { [weak self] in
+                self?.tabGroups.add(token, to: gid)
+                self?.reloadSidebars()
+            }
+            item.state = tabGroups.groupID(of: token) == gid ? .on : .off
+            sub.addItem(item)
+        }
+        if sub.items.isEmpty {
+            let empty = NSMenuItem(title: "无分组", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            sub.addItem(empty)
+        }
+        move.submenu = sub
+        menu.addItem(move)
+        if tabGroups.groupID(of: token) != nil {
+            menu.addItem(actionItem("移出分组") { [weak self] in
+                self?.tabGroups.remove(token)
+                self?.reloadSidebars()
+            })
+        }
+        let pinned = pinnedSessions.contains(id)
+        menu.addItem(actionItem(pinned ? "取消固定" : "固定标签") { [weak self] in
+            self?.setSessionPinned(id, pinned == false)
+        })
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: anchor)
+        menuActions.removeAll()
+    }
+    private func renameTab(_ id: ObjectIdentifier, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { customTitles.removeValue(forKey: id) }
+        else { customTitles[id] = trimmed }
+        reloadSidebars()
+    }
+
+    private func setSessionPinned(_ id: ObjectIdentifier, _ on: Bool) {
+        if on {
+            pinnedSessions.insert(id)
+            if let token = sessionToken[id] { tabGroups.remove(token) }
+        } else {
+            pinnedSessions.remove(id)
+        }
+        reloadSidebars()
+    }
+
+    private var menuActions: [ObjectIdentifier: () -> Void] = [:]
+
+    private func actionItem(_ title: String, _ run: @escaping () -> Void) -> NSMenuItem {
+        let it = NSMenuItem(title: title, action: #selector(runMenuAction(_:)), keyEquivalent: "")
+        it.target = self
+        menuActions[ObjectIdentifier(it)] = run
+        return it
+    }
+
+    @objc private func runMenuAction(_ sender: NSMenuItem) {
+        menuActions[ObjectIdentifier(sender)]?()
+    }
+
+    private func currentToken() -> UUID? {
+        guard let win = window, win.identifier?.rawValue == "agent-term" else { return nil }
+        noteSession(win)
+        return sessionToken[ObjectIdentifier(win)]
+    }
+
+    private func groupUUID(_ key: String) -> UUID? {
+        guard key.hasPrefix("group:") else { return nil }
+        return UUID(uuidString: String(key.dropFirst("group:".count)))
+    }
+
+    private func liveMembers(_ id: UUID) -> [NSWindow] {
+        guard let group = tabGroups.groups.first(where: { $0.id == id }) else { return [] }
+        return group.members.compactMap { token in
+            sessions().first { sessionToken[ObjectIdentifier($0)] == token }
+        }
+    }
+
+    private func directory(of win: NSWindow?) -> String? {
+        guard let win else { return nil }
+        return (focusedPane(in: win) ?? panes(in: win).first)?.liveDirectory()
+    }
+
+    private func visibleSidebars() -> [TabSidebar] {
+        sessions().compactMap { win in
+            guard let host = win.contentView?.subviews.compactMap({ $0 as? ShellView }).first, host.showSidebar else { return nil }
+            return host.sidebar
+        }
+    }
+
+    private func reloadSidebars() {
+        let rows = sidebarRows()
+        for win in sessions() {
+            win.contentView?.subviews.compactMap { $0 as? ShellView }.first?.sidebar.render(rows)
+        }
+    }
+
+    private func sidebarRows() -> [SideRow] {
+        let wins = sessions().sorted { lhs, rhs in
+            let left = orderMode == .created ? createdAt[ObjectIdentifier(lhs)] : updatedAt[ObjectIdentifier(lhs)]
+            let right = orderMode == .created ? createdAt[ObjectIdentifier(rhs)] : updatedAt[ObjectIdentifier(rhs)]
+            return (left ?? .distantPast) < (right ?? .distantPast)
+        }
+        if groupMode == .none {
+            return namedRows(wins)
+        }
+        var buckets: [String: [NSWindow]] = [:]
+        for win in wins {
+            buckets[groupKey(win), default: []].append(win)
+        }
+        var rows: [SideRow] = []
+        var index = 1
+        for key in orderedKeys(Array(buckets.keys)) {
+            let collapsed = collapsedGroups.contains(key)
+            let members = buckets[key] ?? []
+            let extras = members.reduce(0) { count, win in count + shelf.filter { $0.win === win && $0.groupKey == key && $0.pane != nil }.count }
+            rows.append(.header(key: key, title: groupTitle(key), collapsed: collapsed, count: members.count + extras, named: true))
+            if collapsed { continue }
+            for win in members {
+                rows.append(tabRow(win, index: index))
+                index += 1
+                appendShelf(in: win, key: key, rows: &rows, index: &index)
+            }
+        }
+        return rows
+    }
+
+    private func namedRows(_ wins: [NSWindow]) -> [SideRow] {
+        let grouped = Set(tabGroups.groups.flatMap(\.members))
+        var rows: [SideRow] = []
+        var index = 1
+        func append(_ list: [NSWindow], key: String?) {
+            for win in list {
+                rows.append(tabRow(win, index: index))
+                index += 1
+                if let key { appendShelf(in: win, key: key, rows: &rows, index: &index) }
+            }
+        }
+        func ungrouped(_ pinned: Bool) -> [NSWindow] {
+            wins.filter { win in
+                let id = ObjectIdentifier(win)
+                if let token = sessionToken[id], grouped.contains(token) { return false }
+                return pinnedSessions.contains(id) == pinned
+            }
+        }
+        func appendGroups(_ pinned: Bool) {
+            for group in tabGroups.groups where pinnedGroups.contains(group.id) == pinned {
+                let key = "group:\(group.id)"
+                let members = liveMembers(group.id)
+                let extras = members.reduce(0) { count, win in count + shelf.filter { $0.win === win && $0.groupKey == key && $0.pane != nil }.count }
+                rows.append(.header(key: key, title: group.name, collapsed: collapsedGroups.contains(key), count: members.count + extras, named: true))
+                if collapsedGroups.contains(key) { continue }
+                append(members, key: key)
+            }
+        }
+        appendGroups(true)
+        append(ungrouped(true), key: nil)
+        appendGroups(false)
+        append(ungrouped(false), key: nil)
+        return rows
+    }
+
+    private func tabRow(_ win: NSWindow, index: Int) -> SideRow {
+        let title = sessionTitle(win)
+        let id = ObjectIdentifier(win)
+        return .tab(id: id, title: title, index: index, active: win === window, pinned: pinnedSessions.contains(id))
+    }
+
+    private func sessionTitle(_ win: NSWindow) -> String {
+        if let custom = customTitles[ObjectIdentifier(win)], custom.isEmpty == false { return custom }
+        if let pane = focusedPane(in: win) ?? panes(in: win).first {
+            let name = URL(fileURLWithPath: pane.liveDirectory()).lastPathComponent
+            if name.isEmpty == false { return name }
+        }
+        return win.title.isEmpty ? "终端" : win.title
+    }
+
+    private func groupKey(_ win: NSWindow) -> String {
+        switch groupMode {
+        case .project:
+            let path = (focusedPane(in: win) ?? panes(in: win).first)?.liveDirectory() ?? ""
+            return projectName(path)
+        case .date:
+            let date = orderMode == .updated
+                ? (updatedAt[ObjectIdentifier(win)] ?? Date())
+                : (createdAt[ObjectIdentifier(win)] ?? Date())
+            if Calendar.current.isDateInToday(date) { return "今天" }
+            if Calendar.current.isDateInYesterday(date) { return "昨天" }
+            return "更早"
+        case .none:
+            return ""
+        }
+    }
+
+    private func projectName(_ path: String) -> String {
+        guard path.isEmpty == false else { return "其他" }
+        var url = URL(fileURLWithPath: path)
+        let fm = FileManager.default
+        while url.path != "/" {
+            if fm.fileExists(atPath: url.appendingPathComponent(".git").path) {
+                return url.lastPathComponent
+            }
+            url.deleteLastPathComponent()
+        }
+        return URL(fileURLWithPath: path).lastPathComponent
     }
 }
 

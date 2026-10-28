@@ -12,9 +12,9 @@ final class TerminalHost: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
+        layer?.backgroundColor = NSColor.clear.cgColor
         hint.font = NSFont.systemFont(ofSize: 11)
-        hint.textColor = NSColor.white.withAlphaComponent(0.55)
+        hint.textColor = .secondaryLabelColor
         hint.drawsBackground = false
         hint.isBezeled = false
         hint.isEditable = false
@@ -23,17 +23,38 @@ final class TerminalHost: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    private var panes: [TermPane] = []
+    private(set) var shown: TermPane?
+
     func setRoot(_ view: NSView) {
-        if root !== view, root?.superview === self {
-            root?.removeFromSuperview()
+        guard let pane = view as? TermPane else { return }
+        addPane(pane)
+    }
+
+    func addPane(_ pane: TermPane) {
+        if panes.contains(where: { $0 === pane }) == false {
+            panes.append(pane)
         }
-        root = view
-        view.translatesAutoresizingMaskIntoConstraints = true
-        view.autoresizingMask = []
-        if view.superview !== self {
-            addSubview(view, positioned: .below, relativeTo: hint)
+        pane.translatesAutoresizingMaskIntoConstraints = true
+        pane.autoresizingMask = []
+        if pane.superview !== self {
+            addSubview(pane, positioned: .below, relativeTo: hint)
         }
+        show(pane)
+    }
+
+    func show(_ pane: TermPane) {
+        if panes.contains(where: { $0 === pane }) == false { panes.append(pane) }
+        shown = pane
+        root = pane
+        for other in panes where other !== pane { other.isHidden = true }
+        pane.isHidden = false
         needsLayout = true
+        needsLayout = true
+    }
+
+    func showFirst() {
+        if let first = panes.first { show(first) }
     }
 
     override func layout() {
@@ -41,17 +62,24 @@ final class TerminalHost: NSView {
         let bar: CGFloat = 22
         hint.frame = NSRect(x: 10, y: 3, width: max(0, bounds.width - 20), height: 16)
         root?.frame = NSRect(x: 0, y: bar, width: bounds.width, height: max(0, bounds.height - bar))
+        let frame = NSRect(x: 0, y: bar, width: bounds.width, height: max(0, bounds.height - bar))
+        for pane in panes { pane.frame = frame }
     }
 }
 
 final class ShellView: NSView {
     let host = TerminalHost(frame: .zero)
     let dock = AgentDock(frame: .zero)
+    let sidebar = TabSidebar(frame: .zero)
     var showDock = true
+    var showSidebar = true
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.isOpaque = false
+        addSubview(sidebar)
         addSubview(host)
         addSubview(dock)
     }
@@ -63,12 +91,20 @@ final class ShellView: NSView {
         needsLayout = true
     }
 
+    func setSidebarVisible(_ on: Bool) {
+        showSidebar = on
+        needsLayout = true
+    }
+
     override func layout() {
         super.layout()
-        let width = showDock ? min(400, max(300, floor(bounds.width * 0.34))) : 0
+        let side: CGFloat = showSidebar ? 200 : 0
+        sidebar.isHidden = !showSidebar
+        sidebar.frame = NSRect(x: 0, y: 0, width: side, height: bounds.height)
+        let dockWidth = showDock ? min(400, max(300, floor(bounds.width * 0.34))) : 0
         dock.isHidden = !showDock
-        dock.frame = NSRect(x: bounds.width - width, y: 0, width: width, height: bounds.height)
-        host.frame = NSRect(x: 0, y: 0, width: max(0, bounds.width - width), height: bounds.height)
+        dock.frame = NSRect(x: bounds.width - dockWidth, y: 0, width: dockWidth, height: bounds.height)
+        host.frame = NSRect(x: side, y: 0, width: max(0, bounds.width - side - dockWidth), height: bounds.height)
     }
 }
 
@@ -88,19 +124,28 @@ final class AgentDock: NSView, NSTextViewDelegate {
     private var approvalId: String?
     private let chip = NSTextField(labelWithString: "")
     private let queueLabel = NSTextField(labelWithString: "")
-    private let composer = NSTextView()
+    private let composer = ComposerBox()
     private let composerScroll = NSScrollView()
-    private let placeholder = NSTextField(labelWithString: "描述要做的事\n⌘↩ 发送 · ↩ 换行 · ⌥⌘↩ 排队")
+    private let placeholder = ClickThroughLabel(labelWithString: "描述要做的事\n⌘↩ 发送 · ↩ 换行 · ⌥⌘↩ 排队")
+    private let plate = NSVisualEffectView()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        layer?.backgroundColor = NSColor(srgbRed: 0.09, green: 0.09, blue: 0.10, alpha: 1).cgColor
+        layer?.backgroundColor = NSColor.clear.cgColor
+        appearance = NSAppearance(named: .darkAqua)
+        plate.material = .hudWindow
+        plate.blendingMode = .behindWindow
+        plate.state = .active
+        plate.autoresizingMask = [.width, .height]
+        plate.alphaValue = 0.82
+        plate.frame = bounds
+        addSubview(plate)
 
-        styleLabel(state, size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.7))
-        styleLabel(model, size: 11, weight: .regular, color: NSColor.white.withAlphaComponent(0.4))
-        styleLabel(chip, size: 11, weight: .medium, color: NSColor.systemTeal)
-        styleLabel(queueLabel, size: 11, weight: .medium, color: NSColor.systemOrange)
+        styleLabel(state, size: 11, weight: .semibold, color: .labelColor)
+        styleLabel(model, size: 11, weight: .regular, color: .secondaryLabelColor)
+        styleLabel(chip, size: 11, weight: .medium, color: .systemTeal)
+        styleLabel(queueLabel, size: 11, weight: .medium, color: .systemOrange)
         chip.isHidden = true
         queueLabel.isHidden = true
 
@@ -108,7 +153,7 @@ final class AgentDock: NSView, NSTextViewDelegate {
         transcript.isSelectable = true
         transcript.isRichText = false
         transcript.drawsBackground = false
-        transcript.textColor = NSColor.white.withAlphaComponent(0.92)
+        transcript.textColor = .labelColor
         transcript.font = NSFont.systemFont(ofSize: 13)
         transcript.textContainerInset = NSSize(width: 8, height: 8)
         transcript.isVerticallyResizable = true
@@ -119,8 +164,7 @@ final class AgentDock: NSView, NSTextViewDelegate {
         transcriptScroll.drawsBackground = false
         transcriptScroll.borderType = .noBorder
 
-        approval.wantsLayer = true
-        approval.layer?.backgroundColor = NSColor(srgbRed: 0.16, green: 0.12, blue: 0.05, alpha: 1).cgColor
+        approval.layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.18).cgColor
         approval.layer?.cornerRadius = 6
         approval.isHidden = true
         approvalText.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -135,9 +179,8 @@ final class AgentDock: NSView, NSTextViewDelegate {
         approval.addSubview(deny)
 
         composer.isRichText = false
-        composer.font = NSFont.systemFont(ofSize: 13)
-        composer.textColor = .white
-        composer.insertionPointColor = .white
+        composer.textColor = .labelColor
+        composer.insertionPointColor = .labelColor
         composer.drawsBackground = false
         composer.isVerticallyResizable = true
         composer.isHorizontallyResizable = false
@@ -152,8 +195,7 @@ final class AgentDock: NSView, NSTextViewDelegate {
         composerScroll.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.06).cgColor
         composerScroll.layer?.cornerRadius = 6
 
-        placeholder.font = NSFont.systemFont(ofSize: 12)
-        placeholder.textColor = NSColor.white.withAlphaComponent(0.35)
+        placeholder.textColor = .tertiaryLabelColor
         placeholder.maximumNumberOfLines = 3
 
         let hide = button("收起", #selector(hideDock))
@@ -231,21 +273,42 @@ final class AgentDock: NSView, NSTextViewDelegate {
         window?.makeFirstResponder(composer)
     }
 
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if composerScroll.frame.contains(point) {
+            return composer
+        }
+        let hit = super.hitTest(point)
+        if hit === placeholder || hit === plate { return composer }
+        return hit
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if composerScroll.frame.contains(point) {
+            window?.makeFirstResponder(composer)
+        }
+        super.mouseDown(with: event)
+    }
     func textDidChange(_ notification: Notification) {
         placeholder.isHidden = composer.string.isEmpty == false
     }
 
     override func layout() {
         super.layout()
+        plate.frame = bounds
         let pad: CGFloat = 12
         let width = bounds.width
-        state.frame = NSRect(x: pad, y: bounds.height - 28, width: 80, height: 16)
-        model.frame = NSRect(x: 96, y: bounds.height - 28, width: max(0, width - 168), height: 16)
-        viewWithTag(2)?.frame = NSRect(x: width - 64, y: bounds.height - 32, width: 52, height: 22)
+        let top = Glass.titleInset(in: self) + 8
+        state.frame = NSRect(x: pad, y: bounds.height - top - 16, width: 80, height: 16)
+        model.frame = NSRect(x: 96, y: bounds.height - top - 16, width: max(0, width - 168), height: 16)
+        viewWithTag(2)?.frame = NSRect(x: width - 64, y: bounds.height - top - 20, width: 52, height: 22)
         let footer: CGFloat = 36
         let composerH: CGFloat = 88
         var y = footer + 8
         composerScroll.frame = NSRect(x: pad, y: y, width: width - pad * 2, height: composerH)
+        let box = composerScroll.contentSize
+        composer.minSize = NSSize(width: 0, height: box.height)
+        composer.frame = NSRect(x: 0, y: 0, width: box.width, height: max(box.height, composer.frame.height))
         placeholder.frame = NSRect(x: pad + 10, y: y + composerH - 46, width: width - pad * 2 - 16, height: 40)
         y += composerH + 6
         if queueLabel.isHidden == false {
@@ -264,8 +327,7 @@ final class AgentDock: NSView, NSTextViewDelegate {
             approval.viewWithTag(10)?.frame = NSRect(x: approval.bounds.width - 68, y: 6, width: 58, height: 22)
             y += h + 8
         }
-        let top: CGFloat = 40
-        let transcriptH = max(40, bounds.height - top - y)
+        let transcriptH = max(40, bounds.height - top - 28 - y)
         transcriptScroll.frame = NSRect(x: 4, y: y, width: width - 8, height: transcriptH)
         viewWithTag(3)?.frame = NSRect(x: pad, y: 8, width: 78, height: 24)
         viewWithTag(4)?.frame = NSRect(x: width - 148, y: 8, width: 58, height: 24)
@@ -299,5 +361,17 @@ final class AgentDock: NSView, NSTextViewDelegate {
         button.bezelStyle = .rounded
         button.font = NSFont.systemFont(ofSize: 12)
         return button
+    }
+}
+
+private final class ClickThroughLabel: NSTextField {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+private final class ComposerBox: NSTextView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
     }
 }

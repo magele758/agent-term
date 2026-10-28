@@ -33,23 +33,14 @@ PY
 # ponytail: TTImage is declared in Apple/AppleTerminalView.swift, which pulls in
 # AppKit. The headless core never draws, so a stub satisfies ImageCell.
 
-# ponytail: TerminalViewSearch.swift is excluded; Mac find-bar still calls these.
-printf '%s\n' \
-    'extension TerminalView {' \
-    '    @discardableResult' \
-    '    public func findNext(_ term: String, options: SearchOptions = SearchOptions(), scrollToResult: Bool = true) -> Bool { false }' \
-    '    @discardableResult' \
-    '    public func findPrevious(_ term: String, options: SearchOptions = SearchOptions(), scrollToResult: Bool = true) -> Bool { false }' \
-    '    public func clearSearch() {}' \
-    '}' > "$OUT/SearchStub.swift"
-ui=("$OUT/SearchStub.swift")
+ui=()
 printf 'public class TTImage {}\n' > "$OUT/TTImage.swift"
 st=("$OUT/TTImage.swift")
 while IFS= read -r f; do st+=("$f"); done < <(find "$SWIFTTERM/Sources/SwiftTerm" -name '*.swift' \
     -not -path '*/Mac/*' -not -path '*/iOS/*' -not -path '*/Apple/*' \
     -not -name 'TerminalViewSearch.swift')
 while IFS= read -r f; do ui+=("$f"); done < <(find "$SWIFTTERM/Sources/SwiftTerm" -name '*.swift' \
-    -not -path '*/iOS/*' -not -name 'TerminalViewSearch.swift')
+    -not -path '*/iOS/*')
 
 HEAD_COMMON=(-sdk "$SDK" -target arm64-apple-macosx15.0 -vfsoverlay "$OVERLAY")
 UI_COMMON=(-sdk "$SDK" -target arm64-apple-macosx14.0 -vfsoverlay "$OVERLAY")

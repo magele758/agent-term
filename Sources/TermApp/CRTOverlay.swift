@@ -18,6 +18,7 @@ final class CRTOverlay: NSView {
     private var texture: MTLTexture?
     private var ghost = [MTLTexture?](repeating: nil, count: 2)
     private var ghostSlot = 0
+    private var clearGhost = false
     private var pixels: UnsafeMutableRawPointer?
     private var pixW = 0
     private var pixH = 0
@@ -40,6 +41,7 @@ final class CRTOverlay: NSView {
         metal.pixelFormat = .bgra8Unorm
         metal.framebufferOnly = true
         metal.isOpaque = true
+        metal.presentsWithTransaction = true
         return metal
     }
 
@@ -56,7 +58,7 @@ final class CRTOverlay: NSView {
             red: Double(srgb.redComponent),
             green: Double(srgb.greenComponent),
             blue: Double(srgb.blueComponent),
-            alpha: 1)
+            alpha: 0.2)
     }
 
     func setForeground(_ color: NSColor) {
@@ -141,7 +143,7 @@ final class CRTOverlay: NSView {
     }
 
     @objc private func tick() {
-        guard isEnabled, bounds.width > 2, bounds.height > 2,
+        guard isEnabled, isHidden == false, bounds.width > 2, bounds.height > 2,
               let source, let pipeline, let queue,
               let metal = layer as? CAMetalLayer, metal.device != nil,
               let drawable = metal.nextDrawable() else { return }
@@ -153,12 +155,24 @@ final class CRTOverlay: NSView {
         guard let frameTex, let prev = ghost[ghostSlot], let next = ghost[1 - ghostSlot], let fadePipeline else { return }
 
         let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = frameTex
+        pass.colorAttachments[0].texture = drawable.texture
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].storeAction = .store
-        pass.colorAttachments[0].clearColor = clear
-        guard let buffer = queue.makeCommandBuffer(),
-              let enc = buffer.makeRenderCommandEncoder(descriptor: pass) else { return }
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: clear.red, green: clear.green, blue: clear.blue, alpha: 1)
+        guard let buffer = queue.makeCommandBuffer() else { return }
+        if clearGhost {
+            for slot in ghost {
+                guard let slot else { continue }
+                let wipe = MTLRenderPassDescriptor()
+                wipe.colorAttachments[0].texture = slot
+                wipe.colorAttachments[0].loadAction = .clear
+                wipe.colorAttachments[0].storeAction = .store
+                wipe.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+                buffer.makeRenderCommandEncoder(descriptor: wipe)?.endEncoding()
+            }
+            clearGhost = false
+        }
+        guard let enc = buffer.makeRenderCommandEncoder(descriptor: pass) else { return }
 
         var u = CRTUniforms(
             time: Float(CACurrentMediaTime() - started),
@@ -182,36 +196,30 @@ final class CRTOverlay: NSView {
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
 
-        if let blit = buffer.makeBlitCommandEncoder() {
-            blit.copy(from: frameTex, sourceSlice: 0, sourceLevel: 0,
-                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                      sourceSize: MTLSize(width: dw, height: dh, depth: 1),
-                      to: drawable.texture, destinationSlice: 0, destinationLevel: 0,
-                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-            blit.endEncoding()
-        }
-
         let fadePass = MTLRenderPassDescriptor()
         fadePass.colorAttachments[0].texture = next
         fadePass.colorAttachments[0].loadAction = .dontCare
         fadePass.colorAttachments[0].storeAction = .store
         if let fadeEnc = buffer.makeRenderCommandEncoder(descriptor: fadePass) {
             fadeEnc.setRenderPipelineState(fadePipeline)
-            fadeEnc.setFragmentTexture(frameTex, index: 0)
+            fadeEnc.setFragmentTexture(texture, index: 0)
             fadeEnc.setFragmentTexture(prev, index: 1)
             fadeEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             fadeEnc.endEncoding()
             ghostSlot = 1 - ghostSlot
         }
-        buffer.present(drawable)
         buffer.commit()
+        buffer.waitUntilScheduled()
+        drawable.present()
     }
 
     private func ensureTargets(_ w: Int, _ h: Int) {
+        let fresh = frameTex?.width != w || ghost[0] == nil
         if frameTex?.width == w, frameTex?.height == h, ghost[0] != nil { return }
         frameTex = makeTarget(w, h)
         ghost = [makeTarget(w, h), makeTarget(w, h)]
         ghostSlot = 0
+        if fresh { clearGhost = true }
     }
 
     private func makeTarget(_ w: Int, _ h: Int) -> MTLTexture? {
@@ -238,18 +246,27 @@ final class CRTOverlay: NSView {
         gfx.cgContext.scaleBy(x: scale, y: -scale)
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = gfx
-        view.displayIgnoringOpacity(view.bounds, in: gfx)
-        NSGraphicsContext.restoreGraphicsState()
-        let rowBytes = w * 4
-        let tmp = UnsafeMutableRawPointer.allocate(byteCount: rowBytes, alignment: 16)
-        defer { tmp.deallocate() }
-        for y in 0..<(h / 2) {
-            let top = data.advanced(by: y * rowBytes)
-            let bot = data.advanced(by: (h - 1 - y) * rowBytes)
-            tmp.copyMemory(from: UnsafeRawPointer(top), byteCount: rowBytes)
-            UnsafeMutableRawPointer(top).copyMemory(from: UnsafeRawPointer(bot), byteCount: rowBytes)
-            UnsafeMutableRawPointer(bot).copyMemory(from: tmp, byteCount: rowBytes)
+        let hidden = view.layer?.opacity ?? 1
+        let contents = view.layer?.contents
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view.layer?.opacity = 1
+        view.layer?.contents = nil
+        func reveal(_ v: NSView) {
+            v.layer?.opacity = 1
+            v.layer?.removeAllAnimations()
+            for child in v.subviews { reveal(child) }
         }
+        reveal(view)
+        view.displayIgnoringOpacity(view.bounds, in: gfx)
+        gfx.cgContext.setFillColor(CGColor(red: CGFloat(phosphor.r), green: CGFloat(phosphor.g), blue: CGFloat(phosphor.b), alpha: 1))
+        for sub in view.subviews where sub.isHidden == false && sub.frame.width > 1 && sub.frame.height > 1 {
+            gfx.cgContext.fill(sub.frame)
+        }
+        view.layer?.contents = contents
+        view.layer?.opacity = hidden
+        CATransaction.commit()
+        NSGraphicsContext.restoreGraphicsState()
         if pixW != w || pixH != h || texture == nil {
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
@@ -325,7 +342,7 @@ final class CRTOverlay: NSView {
         float dfreq = mix(4.0, 40.0, fract(sin(floor(u.time * 2.5) * 17.3) * 43758.5453));
         su.x += sin((curved.y + u.time) * dfreq) * dscale * 0.006;
         float2 clamped = clamp(su, 0.0, 1.0);
-        float2 suv = float2(clamped.x, 1.0 - clamped.y);
+        float2 suv = clamped;
         float2 texel = 1.0 / float2(src.get_width(), src.get_height());
 
         float3 glass = float3(u.glassR, u.glassG, u.glassB);
@@ -366,8 +383,15 @@ final class CRTOverlay: NSView {
         c += fg * pass * 0.045 * inside;
         float flickNoise = fract(sin(floor(u.time * 1.5) * 12.9898) * 43758.5453);
         c *= 1.0 + (flickNoise - 0.5) * 0.035;
-        float3 burned = ghost.sample(smp, float2(in.uv.x, 1.0 - in.uv.y)).rgb;
-        c = max(c, burned * 0.42);
+        float2 puv = in.pos.xy / float2(ghost.get_width(), ghost.get_height());
+        float4 acc = ghost.sample(smp, puv);
+        float g = dot(raw, float3(0.21, 0.72, 0.04));
+        float trail = max(0.0, acc.r - g);
+        float span = ghost.get_width();
+        trail = max(trail, max(0.0, ghost.sample(smp, puv - float2(8.0 / span, 0.0)).r - g) * 0.72);
+        trail = max(trail, max(0.0, ghost.sample(smp, puv - float2(16.0 / span, 0.0)).r - g) * 0.4);
+        c = max(c, fg * trail * 0.9);
+        c += fg * acc.g * 0.55;
         float rim = smoothstep(0.0, 0.016, min(box.x, box.y)) * smoothstep(0.04, 0.01, min(box.x, box.y));
         c += fg * rim * 0.08;
         c = mix(glass * 0.35, c, inside);
@@ -378,10 +402,16 @@ final class CRTOverlay: NSView {
                               texture2d<float> frame [[texture(0)]],
                               texture2d<float> prev [[texture(1)]]) {
         constexpr sampler smp(address::clamp_to_edge, filter::linear);
-        float2 guv = float2(in.uv.x, 1.0 - in.uv.y);
-        float3 now = frame.sample(smp, guv).rgb;
-        float3 old = prev.sample(smp, guv).rgb;
-        return float4(max(now, old * 0.972), 1.0);
+        float2 curved = barrel(in.uv, 0.20, 0.008);
+        float2 clamped = clamp(curved, 0.0, 1.0);
+        float lum = dot(frame.sample(smp, clamped).rgb, float3(0.21, 0.72, 0.04));
+        float2 texel = 1.0 / float2(frame.get_width(), frame.get_height());
+        float left = dot(frame.sample(smp, clamped - float2(3.0, 0.0) * texel).rgb, float3(0.21, 0.72, 0.04));
+        float right = dot(frame.sample(smp, clamped + float2(3.0, 0.0) * texel).rgb, float3(0.21, 0.72, 0.04));
+        float cursor = lum * step(0.4, lum) * step(0.35, min(left, right));
+        float2 puv = in.pos.xy / float2(prev.get_width(), prev.get_height());
+        float4 old = prev.sample(smp, puv);
+        return float4(max(old.r - 0.028, lum), max(old.g - 0.018, cursor), 0.0, 1.0);
     }
     """
 }
