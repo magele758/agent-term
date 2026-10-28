@@ -706,6 +706,11 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var closedDirs: [String] = []
     private var zoomHidden: [NSView] = []
     private var quick: NSPanel?
+    private var commandBlocks: [CommandBlock] = []
+    private var blockTimer: Timer?
+    private var blockTargets: [UUID: TermPane] = [:]
+    private var blockScreens: [UUID: String] = [:]
+    private var blockQuiet: [UUID: Int] = [:]
     private enum GroupMode { case none, project, date }
     private enum OrderMode { case created, updated }
     private var groupMode: GroupMode = .project
@@ -746,6 +751,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.center()
         NSApp.activate(ignoringOtherApps: true)
         buildMenu()
+        applyLook()
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             self?.handle(event) ?? event
         }
@@ -886,6 +892,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let side = item("标签侧栏", #selector(toggleSidebar), "l")
         side.keyEquivalentModifierMask = [.command, .shift]
         win.addItem(side)
+        let blocksItem = item("块状界面", #selector(toggleBlocks), "b")
+        blocksItem.keyEquivalentModifierMask = [.command, .shift]
+        win.addItem(blocksItem)
         let reopen = item("重新打开", #selector(reopenClosed), "t")
         reopen.keyEquivalentModifierMask = [.command, .shift]
         win.addItem(reopen)
@@ -975,6 +984,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.refreshHint()
         }
         shell.dock.onApprove = { [weak self] id, allow in self?.finishApproval(id, allow: allow) }
+        shell.blocks.onSubmit = { [weak self] text in self?.submitBlock(text) }
+        shell.blocks.onRerun = { [weak self] text in self?.submitBlock(text) }
     }
 
     private func showDockAndFocus() {
@@ -1221,6 +1232,12 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Glass.install(window)
         shell.host.layer?.backgroundColor = NSColor.clear.cgColor
         for pane in allPanes() { pane.apply(cfg) }
+        let theme = ThemeCatalog.find(cfg.themeName)
+        shell.applyChrome(
+            foreground: color(theme?.foreground ?? cfg.foreground),
+            background: color(theme?.background ?? cfg.background),
+            accent: color(theme?.cursor ?? cfg.cursor)
+        )
         refreshHint()
     }
 
@@ -1228,6 +1245,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var actions: [(String, () -> Void)] = [
             ("设置", { [weak self] in self?.openSettings() }),
             ("打开 Agent 对话", { [weak self] in self?.focusAgent() }),
+            ("块状模式", { [weak self] in self?.setBlockMode(true) }),
+            ("终端模式", { [weak self] in self?.setBlockMode(false) }),
             ("左右分屏", { [weak self] in self?.split(sideBySide: true) }),
             ("上下分屏", { [weak self] in self?.split(sideBySide: false) }),
             ("放大字号", { [weak self] in self?.zoom(by: 1) }),
@@ -1281,12 +1300,13 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var lastSplitAt: TimeInterval = 0
 
     private func split(sideBySide: Bool) {
+        if shell.showBlocks { setBlockMode(false) }
         let now = ProcessInfo.processInfo.systemUptime
         guard splitting == false, now - lastSplitAt > 0.05 else { return }
         splitting = true
         lastSplitAt = now
         defer { splitting = false }
-        guard let pane = focusedPane(), let parent = pane.superview else { return }
+        guard let pane = focusedPane() ?? shell.host.shown ?? firstPane(in: shell.host), let parent = pane.superview else { return }
         let neu = TermPane(frame: pane.frame)
         if let parent = parent as? SplitView {
             parent.divide(pane, with: neu, sideBySide: sideBySide)
@@ -1406,6 +1426,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let host = win.contentView?.subviews.compactMap({ $0 as? ShellView }).first else { return }
         window = win
         shell = host
+        host.onMode = { [weak self] on in self?.setBlockMode(on) }
     }
 
     @discardableResult
@@ -1577,6 +1598,78 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func toggleSidebar() {
         shell.setSidebarVisible(shell.showSidebar == false)
+    }
+
+    @objc func toggleBlocks() {
+        setBlockMode(shell.showBlocks == false)
+    }
+
+    private func setBlockMode(_ on: Bool) {
+        shell.setBlocksVisible(on)
+        if on { shell.blocks.setBlocks(commandBlocks) }
+        window.layoutIfNeeded()
+        if on {
+            shell.blocks.focusInput()
+        } else {
+            (shell.host.shown ?? focusedPane())?.focus()
+        }
+    }
+
+    private func submitBlock(_ command: String) {
+        let wrapped = BlockFeed.wrapped(command)
+        guard wrapped.isEmpty == false else { return }
+        guard let pane = shell.host.shown ?? focusedPane() else { return }
+        pane.term.send(txt: wrapped)
+        let block = CommandBlock(
+            id: UUID(),
+            command: command,
+            output: "",
+            exitCode: nil,
+            cwd: pane.liveDirectory(),
+            running: true
+        )
+        commandBlocks.append(block)
+        blockTargets[block.id] = pane
+        shell.blocks.setBlocks(commandBlocks)
+        guard blockTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] timer in
+            self?.pollBlocks(timer)
+        }
+        blockTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func pollBlocks(_ timer: Timer) {
+        var running = false
+        var changed = false
+        for index in commandBlocks.indices where commandBlocks[index].running {
+            let id = commandBlocks[index].id
+            guard let pane = blockTargets[id] ?? shell.host.shown ?? focusedPane() else { continue }
+            let screen = pane.screenText()
+            let result = BlockFeed.output(from: screen, command: commandBlocks[index].command)
+            if screen == blockScreens[id] { blockQuiet[id, default: 0] += 1 } else { blockQuiet[id] = 0 }
+            blockScreens[id] = screen
+            let stalled = (blockQuiet[id] ?? 0) >= 8 && result.done == false
+            let nextRunning = result.done == false && stalled == false
+            if result.text != commandBlocks[index].output || result.exit != commandBlocks[index].exitCode || nextRunning != commandBlocks[index].running {
+                changed = true
+            }
+            commandBlocks[index].output = result.text
+            commandBlocks[index].exitCode = result.exit
+            commandBlocks[index].running = nextRunning
+            if nextRunning {
+                running = true
+            } else {
+                blockTargets[id] = nil
+                blockScreens[id] = nil
+                blockQuiet[id] = nil
+            }
+        }
+        if changed, shell.showBlocks { shell.blocks.setBlocks(commandBlocks) }
+        if running == false {
+            timer.invalidate()
+            blockTimer = nil
+        }
     }
 
     private func noteSession(_ win: NSWindow) {

@@ -27,8 +27,25 @@ final class TerminalHost: NSView {
     private(set) var shown: TermPane?
 
     func setRoot(_ view: NSView) {
-        guard let pane = view as? TermPane else { return }
-        addPane(pane)
+        if let pane = view as? TermPane {
+            addPane(pane)
+            return
+        }
+        view.translatesAutoresizingMaskIntoConstraints = true
+        view.autoresizingMask = []
+        if view.superview !== self {
+            addSubview(view, positioned: .below, relativeTo: hint)
+        }
+        root = view
+        func reveal(_ node: NSView) {
+            node.isHidden = false
+            node.subviews.forEach(reveal)
+        }
+        reveal(view)
+        for pane in panes where pane.isDescendant(of: view) == false {
+            pane.isHidden = true
+        }
+        needsLayout = true
     }
 
     func addPane(_ pane: TermPane) {
@@ -61,9 +78,15 @@ final class TerminalHost: NSView {
         super.layout()
         let bar: CGFloat = 22
         hint.frame = NSRect(x: 10, y: 3, width: max(0, bounds.width - 20), height: 16)
-        root?.frame = NSRect(x: 0, y: bar, width: bounds.width, height: max(0, bounds.height - bar))
         let frame = NSRect(x: 0, y: bar, width: bounds.width, height: max(0, bounds.height - bar))
-        for pane in panes { pane.frame = frame }
+        root?.frame = frame
+        if root is SplitView {
+            root?.layoutSubtreeIfNeeded()
+        } else {
+            for pane in panes where pane.superview === self {
+                pane.frame = frame
+            }
+        }
     }
 }
 
@@ -71,9 +94,13 @@ final class ShellView: NSView {
     let host = TerminalHost(frame: .zero)
     let dock = AgentDock(frame: .zero)
     let sidebar = TabSidebar(frame: .zero)
+    let blocks = BlockPane(frame: .zero)
+    var showBlocks = false
     var showDock = true
     var showSidebar = true
     private let revealSide = NSButton()
+    private let modeBar = ModeBar()
+    var onMode: ((Bool) -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -92,6 +119,9 @@ final class ShellView: NSView {
         addSubview(revealSide)
         addSubview(host)
         addSubview(dock)
+        addSubview(blocks)
+        modeBar.onPick = { [weak self] blocks in self?.onMode?(blocks) }
+        addSubview(modeBar)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -105,6 +135,17 @@ final class ShellView: NSView {
         showSidebar = on
         needsLayout = true
     }
+
+    func setBlocksVisible(_ on: Bool) {
+        showBlocks = on
+        modeBar.blocks = on
+        needsLayout = true
+    }
+
+    func applyChrome(foreground: NSColor, background: NSColor, accent: NSColor) {
+        modeBar.apply(foreground: foreground, background: background)
+        blocks.apply(foreground: foreground, background: background, accent: accent)
+    }
     @objc private func revealSidebar() { setSidebarVisible(true) }
 
     override func layout() {
@@ -117,8 +158,79 @@ final class ShellView: NSView {
         let dockWidth = showDock ? min(400, max(300, floor(bounds.width * 0.34))) : 0
         dock.isHidden = !showDock
         dock.frame = NSRect(x: bounds.width - dockWidth, y: 0, width: dockWidth, height: bounds.height)
-        host.frame = NSRect(x: side, y: 0, width: max(0, bounds.width - side - dockWidth), height: bounds.height)
+        let top = Glass.titleInset(in: self)
+        let modeH: CGFloat = 28
+        let contentW = max(0, bounds.width - side - dockWidth)
+        modeBar.frame = NSRect(x: side, y: bounds.height - top - modeH, width: contentW, height: modeH)
+        let body = NSRect(x: side, y: 0, width: contentW, height: max(0, bounds.height - top - modeH))
+        host.frame = body
+        blocks.frame = body
+        host.isHidden = showBlocks
+        blocks.isHidden = !showBlocks
     }
+}
+
+private final class ModeBar: NSView {
+    var onPick: ((Bool) -> Void)?
+    var blocks = false { didSet { paint() } }
+    private let terminal = NSButton()
+    private let block = NSButton()
+    private var foreground = BlockChrome.fallout.foreground
+    private var background = BlockChrome.fallout.background
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = background.cgColor
+        configure(terminal, "终端", #selector(pickTerminal))
+        configure(block, "块状", #selector(pickBlocks))
+        addSubview(terminal)
+        addSubview(block)
+        paint()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func apply(foreground: NSColor, background: NSColor) {
+        self.foreground = foreground
+        self.background = background
+        layer?.backgroundColor = background.cgColor
+        paint()
+    }
+
+    override func layout() {
+        super.layout()
+        terminal.frame = NSRect(x: 8, y: 2, width: 52, height: 24)
+        block.frame = NSRect(x: 64, y: 2, width: 52, height: 24)
+    }
+
+    private func configure(_ button: NSButton, _ title: String, _ action: Selector) {
+        button.title = title
+        button.setButtonType(.momentaryChange)
+        button.isBordered = false
+        button.wantsLayer = true
+        button.target = self
+        button.action = action
+    }
+
+    private func paint() {
+        layer?.backgroundColor = background.cgColor
+        style(terminal, on: blocks == false)
+        style(block, on: blocks)
+    }
+
+    private func style(_ button: NSButton, on: Bool) {
+        let color = on ? foreground : foreground.withAlphaComponent(0.45)
+        button.attributedTitle = NSAttributedString(string: button.title, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: on ? .semibold : .regular),
+            .foregroundColor: color
+        ])
+        button.layer?.backgroundColor = (on ? foreground.withAlphaComponent(0.16) : NSColor.clear).cgColor
+        button.layer?.cornerRadius = 4
+    }
+
+    @objc private func pickTerminal() { onPick?(false) }
+    @objc private func pickBlocks() { onPick?(true) }
 }
 
 final class AgentDock: NSView, NSTextViewDelegate {

@@ -23,6 +23,8 @@ final class CRTOverlay: NSView {
     private var pixW = 0
     private var pixH = 0
     private var link: CADisplayLink?
+    private var scratch: NSBitmapImageRep?
+    private var lastCapture = 0.0
     private let started = CACurrentMediaTime()
     private var clear = MTLClearColor(red: 0.23, green: 0.14, blue: 0.06, alpha: 1)
     private var phosphor = (r: Float(0.87), g: Float(0.52), b: Float(0.13))
@@ -143,12 +145,15 @@ final class CRTOverlay: NSView {
     }
 
     @objc private func tick() {
-        guard isEnabled, isHidden == false, bounds.width > 2, bounds.height > 2,
+        guard isEnabled, isHiddenOrHasHiddenAncestor == false, bounds.width > 2, bounds.height > 2,
               let source, let pipeline, let queue,
               let metal = layer as? CAMetalLayer, metal.device != nil,
               let drawable = metal.nextDrawable() else { return }
-        let scale = metal.contentsScale
-        guard capture(source, scale: scale), let texture else { return }
+        let now = CACurrentMediaTime()
+        if now - lastCapture >= 0.032, capture(source, scale: metal.contentsScale) {
+            lastCapture = now
+        }
+        guard texture != nil else { return }
         let dw = max(1, Int(metal.drawableSize.width))
         let dh = max(1, Int(metal.drawableSize.height))
         ensureTargets(dw, dh)
@@ -181,7 +186,7 @@ final class CRTOverlay: NSView {
             bloom: 0.85,
             scan: 0.85,
             rgbShift: 0.0011,
-            lines: Float(bounds.height * scale / 2.0),
+            lines: Float(bounds.height * metal.contentsScale / 2.0),
             glassR: Float(clear.red),
             glassG: Float(clear.green),
             glassB: Float(clear.blue),
@@ -233,15 +238,21 @@ final class CRTOverlay: NSView {
     private func capture(_ view: NSView, scale: CGFloat) -> Bool {
         let w = max(1, Int(view.bounds.width * scale))
         let h = max(1, Int(view.bounds.height * scale))
-        guard let device,
-              let rep = NSBitmapImageRep(
+        guard let device else { return false }
+        let rep: NSBitmapImageRep
+        if let scratch, scratch.pixelsWide == w, scratch.pixelsHigh == h {
+            rep = scratch
+        } else {
+            guard let made = NSBitmapImageRep(
                 bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
                 bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                 colorSpaceName: .deviceRGB,
                 bitmapFormat: [.thirtyTwoBitLittleEndian, .alphaFirst],
-                bytesPerRow: w * 4, bitsPerPixel: 32),
-              let data = rep.bitmapData,
-              let gfx = NSGraphicsContext(bitmapImageRep: rep) else { return false }
+                bytesPerRow: w * 4, bitsPerPixel: 32) else { return false }
+            scratch = made
+            rep = made
+        }
+        guard let data = rep.bitmapData, let gfx = NSGraphicsContext(bitmapImageRep: rep) else { return false }
         gfx.cgContext.translateBy(x: 0, y: CGFloat(h))
         gfx.cgContext.scaleBy(x: scale, y: -scale)
         NSGraphicsContext.saveGraphicsState()
